@@ -1,6 +1,8 @@
 //! Object storage abstraction with conditional writes, plus two local
 //! implementations: [`MemoryStore`] for tests and [`FsStore`] for
-//! single-process development. The S3 implementation lives in `s3.rs`.
+//! single-process development. The S3 implementation lives in `s3.rs`; for
+//! operation counters and fault/latency injection, wrap any store in
+//! `sim::SimStore`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -11,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::StoreError;
+use crate::cache::{escape_key, write_atomic};
 
 /// An object plus the etag the store assigned to that version of it.
 #[derive(Debug, Clone)]
@@ -30,6 +33,23 @@ pub enum CondGet {
 pub enum CondPut {
     Ok { etag: String },
     PreconditionFailed,
+}
+
+/// The CAS predicate shared by conditional stores: `expected: None` means
+/// create-only (the object must be absent).
+pub(crate) fn cas_matches(current: Option<&str>, expected: Option<&str>) -> bool {
+    match (current, expected) {
+        (None, None) => true,
+        (Some(c), Some(e)) => c == e,
+        _ => false,
+    }
+}
+
+pub(crate) fn nanos_since_epoch() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// Minimal object-store surface WalTier needs. Etags are opaque; the store
@@ -64,14 +84,11 @@ pub trait ObjectStore: Send + Sync {
     fn delete(&self, key: &str) -> Result<(), StoreError>;
 }
 
-/// In-memory store with operation counters, for tests.
+/// In-memory store for tests.
 #[derive(Default)]
 pub struct MemoryStore {
     objects: Mutex<HashMap<String, Stored>>,
     next_etag: AtomicU64,
-    full_gets: AtomicU64,
-    not_modified_gets: AtomicU64,
-    puts: AtomicU64,
 }
 
 impl MemoryStore {
@@ -81,21 +98,6 @@ impl MemoryStore {
 
     fn fresh_etag(&self) -> String {
         format!("\"{}\"", self.next_etag.fetch_add(1, Ordering::SeqCst))
-    }
-
-    /// Gets that returned a body.
-    pub fn full_gets(&self) -> u64 {
-        self.full_gets.load(Ordering::SeqCst)
-    }
-
-    /// Conditional gets answered with NotModified.
-    pub fn not_modified_gets(&self) -> u64 {
-        self.not_modified_gets.load(Ordering::SeqCst)
-    }
-
-    /// Successful puts, conditional or not.
-    pub fn puts(&self) -> u64 {
-        self.puts.load(Ordering::SeqCst)
     }
 
     /// Sorted keys currently stored.
@@ -108,26 +110,7 @@ impl MemoryStore {
 
 impl ObjectStore for MemoryStore {
     fn get(&self, key: &str) -> Result<Option<Stored>, StoreError> {
-        let found = self.objects.lock().unwrap().get(key).cloned();
-        if found.is_some() {
-            self.full_gets.fetch_add(1, Ordering::SeqCst);
-        }
-        Ok(found)
-    }
-
-    fn get_if_changed(&self, key: &str, etag: Option<&str>) -> Result<CondGet, StoreError> {
-        let objects = self.objects.lock().unwrap();
-        match (objects.get(key), etag) {
-            (None, _) => Ok(CondGet::Missing),
-            (Some(s), Some(e)) if s.etag == e => {
-                self.not_modified_gets.fetch_add(1, Ordering::SeqCst);
-                Ok(CondGet::NotModified)
-            }
-            (Some(s), _) => {
-                self.full_gets.fetch_add(1, Ordering::SeqCst);
-                Ok(CondGet::Changed(s.clone()))
-            }
-        }
+        Ok(self.objects.lock().unwrap().get(key).cloned())
     }
 
     fn put_if_match(
@@ -137,13 +120,7 @@ impl ObjectStore for MemoryStore {
         data: &[u8],
     ) -> Result<CondPut, StoreError> {
         let mut objects = self.objects.lock().unwrap();
-        let current = objects.get(key).map(|s| s.etag.as_str());
-        let matches = match (current, etag) {
-            (None, None) => true,
-            (Some(c), Some(e)) => c == e,
-            _ => false,
-        };
-        if !matches {
+        if !cas_matches(objects.get(key).map(|s| s.etag.as_str()), etag) {
             return Ok(CondPut::PreconditionFailed);
         }
         let new_etag = self.fresh_etag();
@@ -154,7 +131,6 @@ impl ObjectStore for MemoryStore {
                 etag: new_etag.clone(),
             },
         );
-        self.puts.fetch_add(1, Ordering::SeqCst);
         Ok(CondPut::Ok { etag: new_etag })
     }
 
@@ -167,7 +143,6 @@ impl ObjectStore for MemoryStore {
                 etag: etag.clone(),
             },
         );
-        self.puts.fetch_add(1, Ordering::SeqCst);
         Ok(etag)
     }
 
@@ -198,21 +173,17 @@ impl FsStore {
     }
 
     fn path(&self, key: &str) -> PathBuf {
-        self.root.join(key.replace('/', "__"))
+        self.root.join(escape_key(key))
     }
 
     fn etag_path(&self, key: &str) -> PathBuf {
-        self.root.join(format!("{}.etag", key.replace('/', "__")))
+        self.root.join(format!("{}.etag", escape_key(key)))
     }
 
     fn fresh_etag(&self) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
         format!(
             "\"{:x}-{}\"",
-            nanos,
+            nanos_since_epoch(),
             self.counter.fetch_add(1, Ordering::SeqCst)
         )
     }
@@ -226,10 +197,8 @@ impl FsStore {
     }
 
     fn write_object(&self, key: &str, data: &[u8]) -> Result<String, StoreError> {
-        let path = self.path(key);
-        let tmp = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
-        fs::write(&tmp, data).map_err(|e| StoreError(format!("write {key}: {e}")))?;
-        fs::rename(&tmp, &path).map_err(|e| StoreError(format!("rename {key}: {e}")))?;
+        write_atomic(&self.path(key), &[data])
+            .map_err(|e| StoreError(format!("write {key}: {e}")))?;
         let etag = self.fresh_etag();
         fs::write(self.etag_path(key), &etag)
             .map_err(|e| StoreError(format!("write etag for {key}: {e}")))?;
@@ -257,13 +226,7 @@ impl ObjectStore for FsStore {
         data: &[u8],
     ) -> Result<CondPut, StoreError> {
         let _guard = self.lock.lock().unwrap();
-        let current = self.current_etag(key)?;
-        let matches = match (&current, etag) {
-            (None, None) => true,
-            (Some(c), Some(e)) => c == e,
-            _ => false,
-        };
-        if !matches {
+        if !cas_matches(self.current_etag(key)?.as_deref(), etag) {
             return Ok(CondPut::PreconditionFailed);
         }
         Ok(CondPut::Ok {

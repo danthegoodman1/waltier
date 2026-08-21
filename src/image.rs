@@ -3,8 +3,10 @@
 //! Layout (little-endian):
 //! - magic `WTL1`
 //! - u8 has_snapshot; if 1: u64 snapshot_lsn, u32 key_len, key (utf8)
-//! - u64 first_lsn (must equal snapshot_lsn + 1, or 0 with no snapshot)
 //! - u32 entry count, then per entry: u32 len, bytes
+//!
+//! Entry LSNs are implicit: `snapshot_lsn + 1` (or 0 with no snapshot) plus
+//! the entry's index.
 
 use std::collections::VecDeque;
 
@@ -61,9 +63,33 @@ impl WalImage {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64 + self.entry_bytes() as usize);
+        self.encode_view(None, 0, None)
+    }
+
+    /// Encode the image as it will look with `snapshot` overriding the
+    /// current ref, the first `skip` entries folded away, and `extra`
+    /// appended — without materializing that image. This is the write path's
+    /// encoder: the caller mutates the real image only after the store
+    /// accepts the bytes.
+    pub fn encode_view(
+        &self,
+        snapshot: Option<&SnapshotRef>,
+        skip: usize,
+        extra: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let snapshot = snapshot.or(self.snapshot.as_ref());
+        let kept = self.entries.iter().skip(skip);
+        let kept_bytes: usize = kept.clone().map(|e| 4 + e.len()).sum();
+        let count = self.entries.len() - skip + extra.map_or(0, |_| 1);
+        let mut out = Vec::with_capacity(
+            4 + 1
+                + snapshot.map_or(0, |s| 12 + s.key.len())
+                + 4
+                + kept_bytes
+                + extra.map_or(0, |e| 4 + e.len()),
+        );
         out.extend_from_slice(MAGIC);
-        match &self.snapshot {
+        match snapshot {
             None => out.push(0),
             Some(s) => {
                 out.push(1);
@@ -72,9 +98,12 @@ impl WalImage {
                 out.extend_from_slice(s.key.as_bytes());
             }
         }
-        out.extend_from_slice(&self.first_lsn().to_le_bytes());
-        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
-        for e in &self.entries {
+        out.extend_from_slice(&(count as u32).to_le_bytes());
+        for e in kept {
+            out.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            out.extend_from_slice(e);
+        }
+        if let Some(e) = extra {
             out.extend_from_slice(&(e.len() as u32).to_le_bytes());
             out.extend_from_slice(e);
         }
@@ -97,13 +126,6 @@ impl WalImage {
             }
             _ => return Err(WalError::Corrupt("bad snapshot flag".into())),
         };
-        let first_lsn = r.u64()?;
-        let expected = snapshot.as_ref().map(|s| s.lsn + 1).unwrap_or(0);
-        if first_lsn != expected {
-            return Err(WalError::Corrupt(format!(
-                "first_lsn {first_lsn} disagrees with snapshot (expected {expected})"
-            )));
-        }
         let count = r.u32()? as usize;
         let mut entries = VecDeque::with_capacity(count.min(r.remaining() / 4 + 1));
         for _ in 0..count {
@@ -180,6 +202,27 @@ mod tests {
         assert_eq!(decoded.tip(), Some(44));
         let got: Vec<(Lsn, &[u8])> = decoded.entries_from(43).collect();
         assert_eq!(got, vec![(43, &b""[..]), (44, &b"three"[..])]);
+    }
+
+    #[test]
+    fn encode_view_applies_fold_and_extra() {
+        let mut img = WalImage::empty();
+        img.entries.push_back(b"a".to_vec());
+        img.entries.push_back(b"b".to_vec());
+        img.entries.push_back(b"c".to_vec());
+        let sr = SnapshotRef {
+            key: "snap/k".into(),
+            lsn: 1,
+        };
+        let data = img.encode_view(Some(&sr), 2, Some(b"dd"));
+        assert_eq!(data.len(), data.capacity(), "capacity hint must be exact");
+        let decoded = WalImage::decode(&data).unwrap();
+        assert_eq!(decoded.snapshot, Some(sr));
+        assert_eq!(decoded.first_lsn(), 2);
+        assert_eq!(
+            decoded.entries,
+            VecDeque::from(vec![b"c".to_vec(), b"dd".to_vec()])
+        );
     }
 
     #[test]

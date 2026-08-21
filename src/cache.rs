@@ -3,9 +3,27 @@
 //! durable copy, so a lost or stale cache only costs an extra download.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// Flatten an object key into a single filename component.
+pub(crate) fn escape_key(key: &str) -> String {
+    key.replace('/', "__")
+}
+
+/// Write `parts` to `path` via a temp file and rename, so readers never see
+/// a torn file.
+pub(crate) fn write_atomic(path: &Path, parts: &[&[u8]]) -> io::Result<()> {
+    let tmp = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
+    let mut file = fs::File::create(&tmp)?;
+    for part in parts {
+        file.write_all(part)?;
+    }
+    drop(file);
+    fs::rename(&tmp, path)
+}
+
+#[derive(Clone)]
 pub(crate) struct Cache {
     dir: PathBuf,
 }
@@ -23,7 +41,7 @@ impl Cache {
     }
 
     fn snap_path(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("snap-{}", key.replace('/', "_")))
+        self.dir.join(format!("snap-{}", escape_key(key)))
     }
 
     /// The cached WAL image and the etag it was fetched under.
@@ -41,11 +59,10 @@ impl Cache {
         if etag.len() > u16::MAX as usize {
             return;
         }
-        let mut buf = Vec::with_capacity(2 + etag.len() + image.len());
-        buf.extend_from_slice(&(etag.len() as u16).to_le_bytes());
-        buf.extend_from_slice(etag.as_bytes());
-        buf.extend_from_slice(image);
-        let _ = write_atomic(&self.wal_path(), &buf);
+        let mut header = Vec::with_capacity(2 + etag.len());
+        header.extend_from_slice(&(etag.len() as u16).to_le_bytes());
+        header.extend_from_slice(etag.as_bytes());
+        let _ = write_atomic(&self.wal_path(), &[&header, image]);
     }
 
     pub fn load_snapshot(&self, key: &str) -> Option<Vec<u8>> {
@@ -53,16 +70,10 @@ impl Cache {
     }
 
     pub fn save_snapshot(&self, key: &str, data: &[u8]) {
-        let _ = write_atomic(&self.snap_path(key), data);
+        let _ = write_atomic(&self.snap_path(key), &[data]);
     }
 
     pub fn remove_snapshot(&self, key: &str) {
         let _ = fs::remove_file(self.snap_path(key));
     }
-}
-
-fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
-    let tmp = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
-    fs::write(&tmp, data)?;
-    fs::rename(&tmp, path)
 }

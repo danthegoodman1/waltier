@@ -58,12 +58,29 @@ fn decode_history(bytes: &[u8]) -> Result<History, WalError> {
     let mut pos = 0;
     while pos < bytes.len() {
         let corrupt = || WalError::App("bad history snapshot".into());
-        let lsn = u64::from_le_bytes(bytes.get(pos..pos + 8).ok_or_else(corrupt)?.try_into().unwrap());
+        let lsn = u64::from_le_bytes(
+            bytes
+                .get(pos..pos + 8)
+                .ok_or_else(corrupt)?
+                .try_into()
+                .unwrap(),
+        );
         let len = u32::from_le_bytes(
-            bytes.get(pos + 8..pos + 12).ok_or_else(corrupt)?.try_into().unwrap(),
+            bytes
+                .get(pos + 8..pos + 12)
+                .ok_or_else(corrupt)?
+                .try_into()
+                .unwrap(),
         ) as usize;
-        let data = bytes.get(pos + 12..pos + 12 + len).ok_or_else(corrupt)?.to_vec();
-        assert_eq!(lsn, h.len() as u64, "snapshot history must be contiguous from 0");
+        let data = bytes
+            .get(pos + 12..pos + 12 + len)
+            .ok_or_else(corrupt)?
+            .to_vec();
+        assert_eq!(
+            lsn,
+            h.len() as u64,
+            "snapshot history must be contiguous from 0"
+        );
         h.push((lsn, data));
         pos += 12 + len;
     }
@@ -79,7 +96,10 @@ impl WalApp for HistoryApp {
 
     fn apply(&self, state: &mut History, lsn: Lsn, entry: &[u8]) {
         let expected = state.last().map(|(l, _)| l + 1).unwrap_or(0);
-        assert_eq!(lsn, expected, "apply must be called exactly once per LSN, in order");
+        assert_eq!(
+            lsn, expected,
+            "apply must be called exactly once per LSN, in order"
+        );
         state.push((lsn, entry.to_vec()));
     }
 
@@ -110,7 +130,10 @@ impl WalApp for HistoryApp {
 
 const WRITERS: usize = 2;
 const REPLICAS: usize = 1;
-const FAULT_PLAN: Faults = Faults { fail_clean: 0.06, fail_ambiguous: 0.04 };
+const FAULT_PLAN: Faults = Faults {
+    fail_clean: 0.06,
+    fail_ambiguous: 0.04,
+};
 
 struct Slot<T> {
     instance: Option<T>,
@@ -150,23 +173,28 @@ impl Sim {
         };
         let app = HistoryApp { mode, compact_at };
         let raw = Arc::new(MemoryStore::new());
-        let store = Arc::new(
-            SimStore::new(raw.clone()).with_faults(rng.next_u64(), Faults::default()),
-        );
+        let store =
+            Arc::new(SimStore::new(raw.clone()).with_faults(rng.next_u64(), Faults::default()));
 
         let mut writers = Vec::new();
         for _ in 0..WRITERS {
             let dir = TempDir::new().unwrap();
             let s: Arc<dyn ObjectStore> = store.clone();
             let w = WalTier::open(s, app, Options::new(dir.path())).unwrap();
-            writers.push(Slot { instance: Some(w), dir });
+            writers.push(Slot {
+                instance: Some(w),
+                dir,
+            });
         }
         let mut replicas = Vec::new();
         for _ in 0..REPLICAS {
             let dir = TempDir::new().unwrap();
             let s: Arc<dyn ObjectStore> = store.clone();
             let r = Replica::open(s, app, Options::new(dir.path())).unwrap();
-            replicas.push(Slot { instance: Some(r), dir });
+            replicas.push(Slot {
+                instance: Some(r),
+                dir,
+            });
         }
         let oracle_dir = TempDir::new().unwrap();
         let s: Arc<dyn ObjectStore> = raw.clone();
@@ -226,14 +254,14 @@ impl Sim {
         if w.compaction_running() {
             w.wait_for_compaction();
         }
-        if !self.faults {
-            if let Some(e) = w.last_compaction_error() {
-                assert!(
-                    e.contains("is gone"),
-                    "seed {}: unexpected compaction failure: {e}",
-                    self.seed
-                );
-            }
+        if !self.faults
+            && let Some(e) = w.last_compaction_error()
+        {
+            assert!(
+                e.contains("is gone"),
+                "seed {}: unexpected compaction failure: {e}",
+                self.seed
+            );
         }
     }
 
@@ -334,7 +362,10 @@ impl Sim {
             }
             88..94 => {
                 if let Some(w) = self.writers[wi].instance.take() {
-                    assert!(!w.compaction_running(), "settle keeps this false at step boundaries");
+                    assert!(
+                        !w.compaction_running(),
+                        "settle keeps this false at step boundaries"
+                    );
                     if w.has_pending_fold() {
                         // Its uploaded-but-uninstalled snapshot is now an orphan.
                         self.expected_orphans += 1;
@@ -362,7 +393,9 @@ impl Sim {
     /// raw (fault-free) store.
     fn check(&mut self, step: usize) {
         let seed = self.seed;
-        self.oracle.refresh().expect("oracle refresh must always succeed");
+        self.oracle
+            .refresh()
+            .expect("oracle refresh must always succeed");
         let now = self.oracle.state();
         assert!(
             now.len() >= self.observed.len() && now[..self.observed.len()] == self.observed[..],
@@ -389,8 +422,7 @@ impl Sim {
 
         let prefix_of_observed = |state: &History, who: &str| {
             assert!(
-                state.len() <= self.observed.len()
-                    && state[..] == self.observed[..state.len()],
+                state.len() <= self.observed.len() && state[..] == self.observed[..state.len()],
                 "seed {seed} step {step}: {who} state must be a prefix of the committed history"
             );
         };
@@ -409,8 +441,12 @@ impl Sim {
         // With no faults, snapshot objects are exactly accounted for:
         // the referenced one, live pending folds, and crash orphans.
         if !self.faults {
-            let snaps =
-                self.raw.keys().iter().filter(|k| k.starts_with("snap/")).count();
+            let snaps = self
+                .raw
+                .keys()
+                .iter()
+                .filter(|k| k.starts_with("snap/"))
+                .count();
             let pending = self
                 .writers
                 .iter()
@@ -430,7 +466,10 @@ impl Sim {
     fn finish(mut self, steps: usize) -> u64 {
         self.store.set_faults(Faults::default());
         for wi in 0..WRITERS {
-            assert!(self.writer_alive(wi, steps), "reopen must succeed once faults stop");
+            assert!(
+                self.writer_alive(wi, steps),
+                "reopen must succeed once faults stop"
+            );
             let w = self.writers[wi].instance.as_mut().unwrap();
             w.refresh().unwrap();
             w.flush().unwrap();
@@ -440,7 +479,12 @@ impl Sim {
                 Ok(_) => {}
                 Err(WalError::Conflict { entry }) => {
                     // Abort mode: the refresh already reconciled; resubmit.
-                    self.writers[wi].instance.as_mut().unwrap().write(entry).unwrap();
+                    self.writers[wi]
+                        .instance
+                        .as_mut()
+                        .unwrap()
+                        .write(entry)
+                        .unwrap();
                 }
                 Err(e) => panic!("seed {}: final write failed: {e}", self.seed),
             }
@@ -459,8 +503,10 @@ impl Sim {
 
 fn run(seed: u64, faults: bool) -> u64 {
     println!("dst: seed {seed} faults={faults}");
-    let steps: usize =
-        std::env::var("DST_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(250);
+    let steps: usize = std::env::var("DST_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(250);
     let mut sim = Sim::new(seed, faults);
     for i in 0..steps {
         sim.step(i);
@@ -472,7 +518,10 @@ fn seed_list(base: u64) -> Vec<u64> {
     if let Ok(s) = std::env::var("DST_SEED") {
         return vec![s.parse().expect("DST_SEED must be a number")];
     }
-    let count: u64 = std::env::var("DST_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let count: u64 = std::env::var("DST_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     (base..base + count).collect()
 }
 

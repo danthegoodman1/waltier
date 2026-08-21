@@ -50,7 +50,10 @@ impl WalApp for BlobKv {
     }
 
     fn compact(&self, base: Option<&[u8]>, entries: &[Entry]) -> Result<Vec<u8>, WalError> {
-        let mut map = base.map(|b| self.restore(b)).transpose()?.unwrap_or_default();
+        let mut map = base
+            .map(|b| self.restore(b))
+            .transpose()?
+            .unwrap_or_default();
         for e in entries {
             self.apply(&mut map, e.lsn, &e.data);
         }
@@ -151,8 +154,14 @@ fn bench_image_growth(cfg: &Cfg, payload: usize) {
     let store = sim_store(cfg.latency);
     let dir = TempDir::new().unwrap();
     let s: Arc<dyn ObjectStore> = store.clone();
-    let mut wal =
-        WalTier::open(s, BlobKv { compact_at: u64::MAX }, Options::new(dir.path())).unwrap();
+    let mut wal = WalTier::open(
+        s,
+        BlobKv {
+            compact_at: u64::MAX,
+        },
+        Options::new(dir.path()),
+    )
+    .unwrap();
 
     let n = cfg.writes;
     let mut timings = Vec::with_capacity(n);
@@ -163,9 +172,7 @@ fn bench_image_growth(cfg: &Cfg, payload: usize) {
         timings.push(t.elapsed());
     }
     let decile = n / 10;
-    let mean = |slice: &[Duration]| {
-        slice.iter().sum::<Duration>() / slice.len() as u32
-    };
+    let mean = |slice: &[Duration]| slice.iter().sum::<Duration>() / slice.len() as u32;
     println!("image growth: entry={payload}B, no compaction, {n} writes");
     println!(
         "  mean write latency: first 10% = {:.1?}, last 10% = {:.1?}; final image = {} B",
@@ -180,8 +187,14 @@ fn bench_open(cfg: &Cfg) {
     let store = sim_store(cfg.latency);
     let dir = TempDir::new().unwrap();
     let s: Arc<dyn ObjectStore> = store.clone();
-    let mut wal =
-        WalTier::open(s, BlobKv { compact_at: u64::MAX }, Options::new(dir.path())).unwrap();
+    let mut wal = WalTier::open(
+        s,
+        BlobKv {
+            compact_at: u64::MAX,
+        },
+        Options::new(dir.path()),
+    )
+    .unwrap();
     let blob = 1 << 20;
     for key in 0..8u32 {
         wal.write(entry_for(key, blob)).unwrap();
@@ -195,19 +208,34 @@ fn bench_open(cfg: &Cfg) {
     let cold_dir = TempDir::new().unwrap();
     let t = Instant::now();
     let s: Arc<dyn ObjectStore> = store.clone();
-    let wal = WalTier::open(s, BlobKv { compact_at: u64::MAX }, Options::new(cold_dir.path()))
-        .unwrap();
+    let wal = WalTier::open(
+        s,
+        BlobKv {
+            compact_at: u64::MAX,
+        },
+        Options::new(cold_dir.path()),
+    )
+    .unwrap();
     let cold = t.elapsed();
     drop(wal);
 
     let t = Instant::now();
     let s: Arc<dyn ObjectStore> = store.clone();
-    let wal = WalTier::open(s, BlobKv { compact_at: u64::MAX }, Options::new(cold_dir.path()))
-        .unwrap();
+    let wal = WalTier::open(
+        s,
+        BlobKv {
+            compact_at: u64::MAX,
+        },
+        Options::new(cold_dir.path()),
+    )
+    .unwrap();
     let warm = t.elapsed();
     drop(wal);
 
-    println!("open with a ~{:.0} MB snapshot:", snapshot_bytes as f64 / 1e6);
+    println!(
+        "open with a ~{:.0} MB snapshot:",
+        snapshot_bytes as f64 / 1e6
+    );
     println!("  cold (empty cache) = {cold:.1?}, warm (cached, etag-validated) = {warm:.1?}");
 }
 
@@ -216,14 +244,26 @@ fn bench_replica(cfg: &Cfg) {
     let store = sim_store(cfg.latency);
     let dw = TempDir::new().unwrap();
     let s: Arc<dyn ObjectStore> = store.clone();
-    let mut wal =
-        WalTier::open(s, BlobKv { compact_at: u64::MAX }, Options::new(dw.path())).unwrap();
+    let mut wal = WalTier::open(
+        s,
+        BlobKv {
+            compact_at: u64::MAX,
+        },
+        Options::new(dw.path()),
+    )
+    .unwrap();
     wal.write(entry_for(0, 64)).unwrap();
 
     let dr = TempDir::new().unwrap();
     let s: Arc<dyn ObjectStore> = store.clone();
-    let mut replica =
-        Replica::open(s, BlobKv { compact_at: u64::MAX }, Options::new(dr.path())).unwrap();
+    let mut replica = Replica::open(
+        s,
+        BlobKv {
+            compact_at: u64::MAX,
+        },
+        Options::new(dr.path()),
+    )
+    .unwrap();
 
     let polls = 20;
     let mut timings = Vec::with_capacity(polls);
@@ -264,12 +304,18 @@ fn main() {
     }
 
     println!("== waltier bench: no store latency (raw library cost) ==");
-    let local = Cfg { latency: Latency::default(), writes: 2000 };
+    let local = Cfg {
+        latency: Latency::default(),
+        writes: 2000,
+    };
     bench_writes(&local, 64, 64);
 
     println!();
     println!("== waltier bench: simulated S3 (rtt {rtt_ms}ms ±20%, {mbps} MB/s) ==");
-    let cfg = Cfg { latency: Latency::s3_like(rtt_ms, mbps), writes };
+    let cfg = Cfg {
+        latency: Latency::s3_like(rtt_ms, mbps),
+        writes,
+    };
     bench_writes(&cfg, 64, 64);
     bench_writes(&cfg, 4096, 64);
     bench_image_growth(&cfg, 256);

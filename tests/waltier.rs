@@ -336,8 +336,9 @@ fn competing_folds_one_wins_loser_cleans_up() {
 }
 
 #[test]
+#[cfg(feature = "sim")]
 fn warm_start_uses_local_cache() {
-    let store = Arc::new(MemoryStore::new());
+    let store = Arc::new(waltier::sim::SimStore::new(Arc::new(MemoryStore::new())));
     let dir = TempDir::new().unwrap();
     let s: Arc<dyn ObjectStore> = store.clone();
     let mut w = WalTier::open(s, Kv::new(), Options::new(dir.path())).unwrap();
@@ -349,31 +350,33 @@ fn warm_start_uses_local_cache() {
     let expected = w.state().clone();
     drop(w);
 
-    let full_gets = store.full_gets();
-    let not_modified = store.not_modified_gets();
+    let before = store.stats();
     let s: Arc<dyn ObjectStore> = store.clone();
     let w = WalTier::open(s, Kv::new(), Options::new(dir.path())).unwrap();
     assert_eq!(w.state(), &expected);
+    let after = store.stats();
     assert_eq!(
-        store.not_modified_gets(),
-        not_modified + 1,
+        after.not_modified,
+        before.not_modified + 1,
         "image validated by etag"
     );
     assert_eq!(
-        store.full_gets(),
-        full_gets,
+        after.gets, before.gets,
         "image and snapshot served from disk cache"
     );
 }
 
 #[test]
+#[cfg(feature = "sim")]
 fn flush_without_fold_is_a_noop() {
-    let store = Arc::new(MemoryStore::new());
-    let (mut w, _d) = writer(&store, Kv::new());
+    let store = Arc::new(waltier::sim::SimStore::new(Arc::new(MemoryStore::new())));
+    let dir = TempDir::new().unwrap();
+    let s: Arc<dyn ObjectStore> = store.clone();
+    let mut w = WalTier::open(s, Kv::new(), Options::new(dir.path())).unwrap();
     w.write(b"set a 1".to_vec()).unwrap();
-    let puts = store.puts();
+    let puts = store.stats().puts;
     w.flush().unwrap();
-    assert_eq!(store.puts(), puts);
+    assert_eq!(store.stats().puts, puts);
 }
 
 #[test]
@@ -396,6 +399,7 @@ fn prefix_scopes_all_objects() {
 /// next refresh picks them up, and a caller that resubmits appends a
 /// duplicate — at-least-once, by design.
 #[test]
+#[cfg(feature = "sim")]
 fn ambiguous_write_put_is_at_least_once() {
     let inner = Arc::new(MemoryStore::new());
     let store = Arc::new(waltier::sim::SimStore::new(inner));
@@ -408,16 +412,25 @@ fn ambiguous_write_put_is_at_least_once() {
     assert_eq!(w.tip(), None, "an unacked write is not applied locally");
 
     assert!(w.refresh().unwrap());
-    assert_eq!(w.tip(), Some(0), "the refresh reveals that the write landed");
+    assert_eq!(
+        w.tip(),
+        Some(0),
+        "the refresh reveals that the write landed"
+    );
     assert_eq!(w.state().get("a").unwrap(), "1");
 
-    assert_eq!(w.write(b"set a 1".to_vec()).unwrap(), 1, "a resubmit duplicates the entry");
+    assert_eq!(
+        w.write(b"set a 1".to_vec()).unwrap(),
+        1,
+        "a resubmit duplicates the entry"
+    );
 }
 
 /// Regression: when the PUT that installs a fold lands but reports an error,
 /// the writer must recognize its own snapshot in the refreshed image and
 /// adopt it — deleting it as "superseded" would destroy the live snapshot.
 #[test]
+#[cfg(feature = "sim")]
 fn ambiguous_fold_install_adopts_own_snapshot() {
     let inner = Arc::new(MemoryStore::new());
     let store = Arc::new(waltier::sim::SimStore::new(inner.clone()));
@@ -431,12 +444,19 @@ fn ambiguous_fold_install_adopts_own_snapshot() {
 
     store.fail_next_mutation_ambiguously("wal");
     w.flush().unwrap_err();
-    assert!(w.has_pending_fold(), "the fold stays pending after the unacked install");
+    assert!(
+        w.has_pending_fold(),
+        "the fold stays pending after the unacked install"
+    );
 
     assert!(w.refresh().unwrap());
     assert!(!w.has_pending_fold());
     assert_eq!(w.stats().snapshot_lsn, Some(1), "the install landed");
-    assert_eq!(snap_keys(&inner).len(), 1, "the referenced snapshot must survive");
+    assert_eq!(
+        snap_keys(&inner).len(),
+        1,
+        "the referenced snapshot must survive"
+    );
 
     // The adopted snapshot serves as base for the next fold, and a cold
     // bootstrap can restore from it.
@@ -505,7 +525,9 @@ fn write_retries_are_bounded_by_max_write_attempts() {
 
     store.conflict.store(true, Ordering::SeqCst);
     let err = w.write(b"set b 2".to_vec()).unwrap_err();
-    let WalError::Conflict { entry } = err else { panic!("expected Conflict, got {err}") };
+    let WalError::Conflict { entry } = err else {
+        panic!("expected Conflict, got {err}")
+    };
     assert_eq!(entry, b"set b 2");
     assert_eq!(store.attempts.load(Ordering::SeqCst), 3);
 

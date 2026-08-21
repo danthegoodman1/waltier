@@ -4,11 +4,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::Cache;
 use crate::image::{SnapshotRef, WalImage};
-use crate::store::{CondGet, CondPut, ObjectStore, Stored};
+use crate::store::{CondGet, CondPut, ObjectStore, Stored, nanos_since_epoch};
 use crate::{Entry, Lsn, Reconcile, WalApp, WalError, WalStats};
 
 /// Bound on re-reading the WAL when a concurrent compaction keeps replacing
@@ -40,30 +39,31 @@ impl Options {
 
     fn snap_key(&self, lsn: Lsn) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
         let count = COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("{}snap/{:020}-{:x}-{:x}", self.prefix, lsn, nanos, count)
+        format!(
+            "{}snap/{:020}-{:x}-{:x}",
+            self.prefix,
+            lsn,
+            nanos_since_epoch(),
+            count
+        )
     }
 }
 
-/// The current snapshot's bytes, tracked alongside `image.snapshot`.
-/// `NotLoaded` means the image references a snapshot whose bytes we have not
-/// pulled; a later compaction fetches them for its base.
-enum SnapBytes {
-    None,
-    Loaded(Arc<Vec<u8>>),
-    NotLoaded,
-}
-
 /// A completed compaction waiting to be installed by the writer's next PUT.
-#[derive(Clone)]
 struct Fold {
     key: String,
     lsn: Lsn,
     bytes: Arc<Vec<u8>>,
+}
+
+impl Fold {
+    /// Whether this fold covers a prefix of the image's live entries — the
+    /// condition for riding on the next PUT. Negated, it means the image has
+    /// moved past the fold.
+    fn applies_to(&self, image: &WalImage) -> bool {
+        self.lsn >= image.first_lsn() && self.lsn < image.next_lsn()
+    }
 }
 
 enum CompactOutcome {
@@ -76,8 +76,28 @@ struct CompactionTask {
     handle: JoinHandle<()>,
 }
 
+/// Read-through snapshot fetch: disk cache first, then the store (filling
+/// the cache). `None` means the object is gone — replaced by a newer fold.
+fn fetch_snapshot(
+    cache: &Cache,
+    store: &dyn ObjectStore,
+    key: &str,
+) -> Result<Option<Vec<u8>>, WalError> {
+    if let Some(bytes) = cache.load_snapshot(key) {
+        return Ok(Some(bytes));
+    }
+    match store.get(key)? {
+        Some(s) => {
+            cache.save_snapshot(key, &s.data);
+            Ok(Some(s.data))
+        }
+        None => Ok(None),
+    }
+}
+
 /// State shared by writer and replica: the synced image, the app state built
-/// from it, and the local cache.
+/// from it, and the local cache. Snapshot bytes live in the disk cache, never
+/// in memory.
 struct Core<A: WalApp> {
     app: Arc<A>,
     store: Arc<dyn ObjectStore>,
@@ -88,7 +108,6 @@ struct Core<A: WalApp> {
     /// `None` only on a replica opened before the WAL exists.
     etag: Option<String>,
     image_len: u64,
-    snapshot_bytes: SnapBytes,
 }
 
 impl<A: WalApp> Core<A> {
@@ -129,48 +148,44 @@ impl<A: WalApp> Core<A> {
                         image: WalImage::empty(),
                         etag: None,
                         image_len: 0,
-                        snapshot_bytes: SnapBytes::None,
                     });
                 }
             };
             let image = WalImage::decode(&stored.data)?;
-            let (mut state, snapshot_bytes) = match &image.snapshot {
-                None => (app.init(), SnapBytes::None),
-                Some(sr) => {
-                    let bytes = match cache.load_snapshot(&sr.key) {
-                        Some(b) => b,
-                        None => match store.get(&sr.key)? {
-                            Some(s) => {
-                                cache.save_snapshot(&sr.key, &s.data);
-                                s.data
-                            }
-                            // Snapshot replaced under us; re-read the WAL.
-                            None => continue,
-                        },
-                    };
-                    (app.restore(&bytes)?, SnapBytes::Loaded(Arc::new(bytes)))
-                }
+            let mut state = match &image.snapshot {
+                None => app.init(),
+                Some(sr) => match fetch_snapshot(&cache, store.as_ref(), &sr.key)? {
+                    Some(bytes) => app.restore(&bytes)?,
+                    // Snapshot replaced under us; re-read the WAL.
+                    None => continue,
+                },
             };
             for (lsn, entry) in image.entries_from(image.first_lsn()) {
                 app.apply(&mut state, lsn, entry);
             }
-            cache.save_wal(&stored.etag, &stored.data);
-            let image_len = stored.data.len() as u64;
-            return Ok(Self {
+            let mut core = Self {
                 app,
                 store,
                 opts,
                 cache,
                 state,
                 image,
-                etag: Some(stored.etag),
-                image_len,
-                snapshot_bytes,
-            });
+                etag: None,
+                image_len: 0,
+            };
+            core.record_image_put(stored.etag, &stored.data);
+            return Ok(core);
         }
         Err(WalError::Corrupt(
             "open kept racing with concurrent compactions".into(),
         ))
+    }
+
+    /// The one place an accepted image version is recorded: cache, etag, size.
+    fn record_image_put(&mut self, etag: String, data: &[u8]) {
+        self.cache.save_wal(&etag, data);
+        self.image_len = data.len() as u64;
+        self.etag = Some(etag);
     }
 
     /// Pull the latest WAL image and advance the state. Returns whether
@@ -191,16 +206,15 @@ impl<A: WalApp> Core<A> {
             };
             let remote = WalImage::decode(&stored.data)?;
             let my_next = self.image.next_lsn();
-            let mut restored = false;
             if remote.first_lsn() <= my_next {
                 for (lsn, entry) in remote.entries_from(my_next) {
                     self.app.apply(&mut self.state, lsn, entry);
                 }
             } else {
-                let sr = remote.snapshot.clone().ok_or_else(|| {
+                let sr = remote.snapshot.as_ref().ok_or_else(|| {
                     WalError::Corrupt("entries start past lsn 0 with no snapshot".into())
                 })?;
-                let Some(bytes) = self.fetch_snapshot(&sr.key)? else {
+                let Some(bytes) = fetch_snapshot(&self.cache, self.store.as_ref(), &sr.key)? else {
                     // Snapshot replaced under us; re-read the WAL.
                     continue;
                 };
@@ -209,38 +223,14 @@ impl<A: WalApp> Core<A> {
                     self.app.apply(&mut state, lsn, entry);
                 }
                 self.state = state;
-                self.snapshot_bytes = SnapBytes::Loaded(Arc::new(bytes));
-                restored = true;
             }
-            if !restored && remote.snapshot != self.image.snapshot {
-                self.snapshot_bytes = if remote.snapshot.is_some() {
-                    SnapBytes::NotLoaded
-                } else {
-                    SnapBytes::None
-                };
-            }
-            self.cache.save_wal(&stored.etag, &stored.data);
             self.image = remote;
-            self.etag = Some(stored.etag);
-            self.image_len = stored.data.len() as u64;
+            self.record_image_put(stored.etag, &stored.data);
             return Ok(true);
         }
         Err(WalError::Corrupt(
             "refresh kept racing with concurrent compactions".into(),
         ))
-    }
-
-    fn fetch_snapshot(&self, key: &str) -> Result<Option<Vec<u8>>, WalError> {
-        if let Some(bytes) = self.cache.load_snapshot(key) {
-            return Ok(Some(bytes));
-        }
-        match self.store.get(key)? {
-            Some(s) => {
-                self.cache.save_snapshot(key, &s.data);
-                Ok(Some(s.data))
-            }
-            None => Ok(None),
-        }
     }
 
     fn stats(&self) -> WalStats {
@@ -282,42 +272,24 @@ impl<A: WalApp> WalTier<A> {
     /// [`WalError::Conflict`] with the entry handed back.
     pub fn write(&mut self, entry: impl Into<Vec<u8>>) -> Result<Lsn, WalError> {
         let mut entry = entry.into();
-        self.integrate_compaction();
-        self.discard_superseded_fold();
-        let wal_key = self.core.opts.wal_key();
+        self.sync_compaction();
         let mut attempts = 0u32;
         loop {
             let lsn = self.core.image.next_lsn();
-            let (candidate, folded) = self.candidate_image(Some(&entry));
-            let data = candidate.encode();
-            let etag = self
-                .core
-                .etag
-                .clone()
-                .expect("writer always holds the wal etag");
-            match self.core.store.put_if_match(&wal_key, Some(&etag), &data)? {
-                CondPut::Ok { etag } => {
-                    self.core.cache.save_wal(&etag, &data);
-                    self.core.etag = Some(etag);
-                    self.core.image_len = data.len() as u64;
-                    self.commit(candidate, folded);
-                    self.core.app.apply(&mut self.core.state, lsn, &entry);
-                    self.maybe_trigger_compaction();
-                    return Ok(lsn);
-                }
-                CondPut::PreconditionFailed => {
-                    self.core.refresh()?;
-                    self.discard_superseded_fold();
-                    attempts += 1;
-                    if attempts >= self.core.opts.max_write_attempts {
-                        return Err(WalError::Conflict { entry });
-                    }
-                    match self.core.app.reconcile(&self.core.state, &entry) {
-                        Reconcile::Retry => {}
-                        Reconcile::Replace(e) => entry = e,
-                        Reconcile::Abort => return Err(WalError::Conflict { entry }),
-                    }
-                }
+            if self.try_install(Some(&entry))? {
+                self.core.app.apply(&mut self.core.state, lsn, &entry);
+                self.core.image.entries.push_back(entry);
+                self.maybe_trigger_compaction();
+                return Ok(lsn);
+            }
+            attempts += 1;
+            if attempts >= self.core.opts.max_write_attempts {
+                return Err(WalError::Conflict { entry });
+            }
+            match self.core.app.reconcile(&self.core.state, &entry) {
+                Reconcile::Retry => {}
+                Reconcile::Replace(e) => entry = e,
+                Reconcile::Abort => return Err(WalError::Conflict { entry }),
             }
         }
     }
@@ -326,36 +298,15 @@ impl<A: WalApp> WalTier<A> {
     /// nothing is pending. Useful on idle logs and before shutdown; a busy
     /// writer installs folds as a side effect of its next `write`.
     pub fn flush(&mut self) -> Result<(), WalError> {
-        self.integrate_compaction();
-        self.discard_superseded_fold();
-        let wal_key = self.core.opts.wal_key();
+        self.sync_compaction();
         let mut attempts = 0u32;
         while self.pending_fold.is_some() {
-            let (candidate, folded) = self.candidate_image(None);
-            if folded.is_none() {
+            if self.try_install(None)? {
                 break;
             }
-            let data = candidate.encode();
-            let etag = self
-                .core
-                .etag
-                .clone()
-                .expect("writer always holds the wal etag");
-            match self.core.store.put_if_match(&wal_key, Some(&etag), &data)? {
-                CondPut::Ok { etag } => {
-                    self.core.cache.save_wal(&etag, &data);
-                    self.core.etag = Some(etag);
-                    self.core.image_len = data.len() as u64;
-                    self.commit(candidate, folded);
-                }
-                CondPut::PreconditionFailed => {
-                    self.core.refresh()?;
-                    self.discard_superseded_fold();
-                    attempts += 1;
-                    if attempts >= self.core.opts.max_write_attempts {
-                        break;
-                    }
-                }
+            attempts += 1;
+            if attempts >= self.core.opts.max_write_attempts {
+                break;
             }
         }
         Ok(())
@@ -364,7 +315,7 @@ impl<A: WalApp> WalTier<A> {
     /// Pull changes other instances have written. Returns whether anything
     /// changed.
     pub fn refresh(&mut self) -> Result<bool, WalError> {
-        self.integrate_compaction();
+        self.sync_compaction();
         let changed = self.core.refresh()?;
         self.discard_superseded_fold();
         Ok(changed)
@@ -374,8 +325,7 @@ impl<A: WalApp> WalTier<A> {
     /// whether one was started (`false` when one is already running, a fold
     /// is pending, or there are no entries to fold).
     pub fn compact_now(&mut self) -> bool {
-        self.integrate_compaction();
-        self.discard_superseded_fold();
+        self.sync_compaction();
         if self.compaction.is_some()
             || self.pending_fold.is_some()
             || self.core.image.entries.is_empty()
@@ -389,19 +339,14 @@ impl<A: WalApp> WalTier<A> {
     /// Block until a running compaction finishes. Returns whether a fold is
     /// now pending installation (install it with `flush` or the next `write`).
     pub fn wait_for_compaction(&mut self) -> bool {
-        let Some(task) = self.compaction.take() else {
-            return self.pending_fold.is_some();
+        let outcome = match &self.compaction {
+            None => return self.pending_fold.is_some(),
+            Some(task) => task
+                .rx
+                .recv()
+                .unwrap_or_else(|_| CompactOutcome::Failed("compaction thread died".into())),
         };
-        let outcome = task.rx.recv();
-        let _ = task.handle.join();
-        match outcome {
-            Ok(CompactOutcome::Done(fold)) => {
-                self.pending_fold = Some(fold);
-                self.discard_superseded_fold();
-            }
-            Ok(CompactOutcome::Failed(msg)) => self.last_compaction_error = Some(msg),
-            Err(_) => self.last_compaction_error = Some("compaction thread died".into()),
-        }
+        self.finish_compaction(outcome);
         self.pending_fold.is_some()
     }
 
@@ -442,55 +387,86 @@ impl<A: WalApp> WalTier<A> {
         self.last_compaction_error.as_deref()
     }
 
-    /// The next PUT's image: the current one, with a valid pending fold
-    /// applied and `extra` appended.
-    fn candidate_image(&self, extra: Option<&[u8]>) -> (WalImage, Option<Fold>) {
-        let mut img = self.core.image.clone();
-        let mut folded = None;
-        if let Some(f) = &self.pending_fold {
-            let first = img.first_lsn();
-            if f.lsn >= first && f.lsn < img.next_lsn() {
-                for _ in 0..=(f.lsn - first) {
-                    img.entries.pop_front();
-                }
-                img.snapshot = Some(SnapshotRef {
+    /// One CAS attempt: PUT the current image with any pending fold applied
+    /// and `extra` appended. Returns whether the PUT was accepted. A lost CAS
+    /// refreshes the state and re-checks the pending fold; the caller decides
+    /// whether to try again. After a win the caller pushes `extra` into the
+    /// image itself.
+    fn try_install(&mut self, extra: Option<&[u8]>) -> Result<bool, WalError> {
+        let data = match &self.pending_fold {
+            Some(f) => {
+                debug_assert!(f.applies_to(&self.core.image));
+                let skip = (f.lsn + 1 - self.core.image.first_lsn()) as usize;
+                let sr = SnapshotRef {
                     key: f.key.clone(),
                     lsn: f.lsn,
-                });
-                folded = Some(f.clone());
+                };
+                self.core.image.encode_view(Some(&sr), skip, extra)
+            }
+            None => self.core.image.encode_view(None, 0, extra),
+        };
+        let etag = self
+            .core
+            .etag
+            .clone()
+            .expect("writer always holds the wal etag");
+        match self
+            .core
+            .store
+            .put_if_match(&self.core.opts.wal_key(), Some(&etag), &data)?
+        {
+            CondPut::Ok { etag } => {
+                self.core.record_image_put(etag, &data);
+                self.install_pending_fold();
+                Ok(true)
+            }
+            CondPut::PreconditionFailed => {
+                self.core.refresh()?;
+                self.discard_superseded_fold();
+                Ok(false)
             }
         }
-        if let Some(e) = extra {
-            img.entries.push_back(e.to_vec());
-        }
-        (img, folded)
     }
 
-    /// Adopt a successfully PUT candidate. When it installed a fold, garbage-
-    /// collect the previous snapshot and adopt the new bytes as the base.
-    fn commit(&mut self, candidate: WalImage, folded: Option<Fold>) {
-        let old_snapshot = std::mem::replace(&mut self.core.image, candidate).snapshot;
-        if let Some(f) = folded {
-            if let Some(old) = old_snapshot
-                && old.key != f.key
-            {
-                let _ = self.core.store.delete(&old.key);
-                self.core.cache.remove_snapshot(&old.key);
-            }
-            self.core.cache.save_snapshot(&f.key, &f.bytes);
-            self.core.snapshot_bytes = SnapBytes::Loaded(f.bytes);
-            self.pending_fold = None;
+    /// After a winning PUT that carried a fold: drop the folded entries, swap
+    /// the snapshot ref, garbage-collect the previous snapshot, and keep the
+    /// new bytes in the disk cache as the base for future compactions.
+    fn install_pending_fold(&mut self) {
+        let Some(f) = self.pending_fold.take() else {
+            return;
+        };
+        let image = &mut self.core.image;
+        for _ in 0..=(f.lsn - image.first_lsn()) {
+            image.entries.pop_front();
         }
+        let old = image.snapshot.replace(SnapshotRef {
+            key: f.key.clone(),
+            lsn: f.lsn,
+        });
+        if let Some(old) = old
+            && old.key != f.key
+        {
+            let _ = self.core.store.delete(&old.key);
+            self.core.cache.remove_snapshot(&old.key);
+        }
+        self.core.cache.save_snapshot(&f.key, &f.bytes);
+    }
+
+    /// Method preamble: fold in a finished compaction and re-check the
+    /// pending fold against the current image.
+    fn sync_compaction(&mut self) {
+        self.integrate_compaction();
+        self.discard_superseded_fold();
     }
 
     /// Drop a pending fold the image has moved past. Normally a remote
     /// compaction won and our snapshot object is an orphan to delete. The
     /// exception: when the image references the fold's own key, our install
-    /// PUT landed even though it reported failure, so adopt the fold as the
-    /// current base — deleting it would destroy the live snapshot.
+    /// PUT landed even though it reported failure, so keep its bytes cached —
+    /// deleting it would destroy the live snapshot.
     fn discard_superseded_fold(&mut self) {
         let Some(f) = &self.pending_fold else { return };
-        if f.lsn >= self.core.image.first_lsn() && f.lsn < self.core.image.next_lsn() {
+        if f.applies_to(&self.core.image) {
             return;
         }
         let installed = self
@@ -502,51 +478,54 @@ impl<A: WalApp> WalTier<A> {
         let f = self.pending_fold.take().expect("checked above");
         if installed {
             self.core.cache.save_snapshot(&f.key, &f.bytes);
-            self.core.snapshot_bytes = SnapBytes::Loaded(f.bytes);
         } else {
             let _ = self.core.store.delete(&f.key);
         }
     }
 
     fn integrate_compaction(&mut self) {
-        let Some(task) = &self.compaction else { return };
-        let outcome = match task.rx.try_recv() {
-            Ok(outcome) => outcome,
-            Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                CompactOutcome::Failed("compaction thread died".into())
-            }
+        let outcome = match &self.compaction {
+            None => return,
+            Some(task) => match task.rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => return,
+                Ok(outcome) => outcome,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    CompactOutcome::Failed("compaction thread died".into())
+                }
+            },
         };
-        let task = self.compaction.take().expect("checked above");
+        self.finish_compaction(outcome);
+    }
+
+    fn finish_compaction(&mut self, outcome: CompactOutcome) {
+        let task = self.compaction.take().expect("a compaction is running");
         let _ = task.handle.join();
         match outcome {
-            CompactOutcome::Done(fold) => self.pending_fold = Some(fold),
+            CompactOutcome::Done(fold) => {
+                self.pending_fold = Some(fold);
+                self.discard_superseded_fold();
+            }
             CompactOutcome::Failed(msg) => self.last_compaction_error = Some(msg),
         }
     }
 
+    /// Called after each successful write. `compact_now` re-verifies
+    /// eligibility, so the guard lives in one place.
     fn maybe_trigger_compaction(&mut self) {
-        self.integrate_compaction();
-        self.discard_superseded_fold();
-        if self.compaction.is_some()
-            || self.pending_fold.is_some()
-            || self.core.image.entries.is_empty()
+        if self.compaction.is_none()
+            && self.pending_fold.is_none()
+            && !self.core.image.entries.is_empty()
+            && self.core.app.should_compact(&self.core.stats())
         {
-            return;
-        }
-        if self.core.app.should_compact(&self.core.stats()) {
-            self.spawn_compaction();
+            self.compact_now();
         }
     }
 
     fn spawn_compaction(&mut self) {
         let app = self.core.app.clone();
         let store = self.core.store.clone();
-        let base = match (&self.core.image.snapshot, &self.core.snapshot_bytes) {
-            (None, _) => BaseSource::None,
-            (Some(_), SnapBytes::Loaded(b)) => BaseSource::Loaded(b.clone()),
-            (Some(sr), _) => BaseSource::Fetch(sr.key.clone()),
-        };
+        let cache = self.core.cache.clone();
+        let base_key = self.core.image.snapshot.as_ref().map(|s| s.key.clone());
         let first = self.core.image.first_lsn();
         let entries: Vec<Entry> = self
             .core
@@ -567,32 +546,27 @@ impl<A: WalApp> WalTier<A> {
         let snap_key = self.core.opts.snap_key(fold_lsn);
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
-            let outcome = run_compaction(app, store, base, entries, fold_lsn, snap_key);
-            let _ = tx.send(outcome);
+            let _ = tx.send(run_compaction(
+                app, store, cache, base_key, entries, fold_lsn, snap_key,
+            ));
         });
         self.compaction = Some(CompactionTask { rx, handle });
     }
 }
 
-enum BaseSource {
-    None,
-    Loaded(Arc<Vec<u8>>),
-    Fetch(String),
-}
-
 fn run_compaction<A: WalApp>(
     app: Arc<A>,
     store: Arc<dyn ObjectStore>,
-    base: BaseSource,
+    cache: Cache,
+    base_key: Option<String>,
     entries: Vec<Entry>,
     fold_lsn: Lsn,
     snap_key: String,
 ) -> CompactOutcome {
-    let base_bytes: Option<Arc<Vec<u8>>> = match base {
-        BaseSource::None => None,
-        BaseSource::Loaded(b) => Some(b),
-        BaseSource::Fetch(key) => match store.get(&key) {
-            Ok(Some(s)) => Some(Arc::new(s.data)),
+    let base = match &base_key {
+        None => None,
+        Some(key) => match fetch_snapshot(&cache, store.as_ref(), key) {
+            Ok(Some(bytes)) => Some(bytes),
             Ok(None) => {
                 return CompactOutcome::Failed(format!(
                     "base snapshot {key} is gone; a later trigger will retry"
@@ -601,7 +575,7 @@ fn run_compaction<A: WalApp>(
             Err(e) => return CompactOutcome::Failed(e.to_string()),
         },
     };
-    let snapshot = match app.compact(base_bytes.as_deref().map(Vec::as_slice), &entries) {
+    let snapshot = match app.compact(base.as_deref(), &entries) {
         Ok(s) => s,
         Err(e) => return CompactOutcome::Failed(e.to_string()),
     };

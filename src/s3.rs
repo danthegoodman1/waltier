@@ -72,40 +72,25 @@ fn read_body(resp: ureq::Response) -> Result<Vec<u8>, StoreError> {
 
 impl ObjectStore for S3Store {
     fn get(&self, key: &str) -> Result<Option<Stored>, StoreError> {
-        let url = self
-            .bucket
-            .get_object(Some(&self.creds), key)
-            .sign(SIGN_TTL);
-        match self.agent.request_url("GET", &url).call() {
-            Ok(resp) => {
-                let etag = etag_of(&resp)?;
-                Ok(Some(Stored {
-                    etag,
-                    data: read_body(resp)?,
-                }))
-            }
-            Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(e) => Err(StoreError(format!("GET {key}: {e}"))),
+        match self.get_if_changed(key, None)? {
+            CondGet::Changed(s) => Ok(Some(s)),
+            CondGet::Missing => Ok(None),
+            CondGet::NotModified => Err(StoreError(format!(
+                "GET {key}: unexpected 304 to an unconditional request"
+            ))),
         }
     }
 
     fn get_if_changed(&self, key: &str, etag: Option<&str>) -> Result<CondGet, StoreError> {
-        let Some(etag) = etag else {
-            return Ok(match self.get(key)? {
-                Some(s) => CondGet::Changed(s),
-                None => CondGet::Missing,
-            });
-        };
         let url = self
             .bucket
             .get_object(Some(&self.creds), key)
             .sign(SIGN_TTL);
-        match self
-            .agent
-            .request_url("GET", &url)
-            .set("If-None-Match", etag)
-            .call()
-        {
+        let mut req = self.agent.request_url("GET", &url);
+        if let Some(etag) = etag {
+            req = req.set("If-None-Match", etag);
+        }
+        match req.call() {
             Ok(resp) if resp.status() == 304 => Ok(CondGet::NotModified),
             Ok(resp) => {
                 let etag = etag_of(&resp)?;

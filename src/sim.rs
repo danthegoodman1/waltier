@@ -3,13 +3,11 @@
 //! deterministic simulation tests and local benchmarks — of WalTier itself
 //! and of apps built on it.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::store::{CondGet, CondPut, ObjectStore, Stored};
 use crate::StoreError;
+use crate::store::{CondGet, CondPut, ObjectStore, Stored};
 
 /// SplitMix64: small, seedable, deterministic. Same seed, same sequence.
 #[derive(Clone)]
@@ -42,11 +40,6 @@ impl Rng {
     pub fn chance(&mut self, p: f64) -> bool {
         p > 0.0 && self.float() < p
     }
-
-    /// An independent RNG derived from this one's stream.
-    pub fn fork(&mut self) -> Rng {
-        Rng::new(self.next_u64())
-    }
 }
 
 /// Fault probabilities per store operation.
@@ -71,7 +64,11 @@ pub struct Latency {
 
 impl Default for Latency {
     fn default() -> Self {
-        Self { rtt: Duration::ZERO, bytes_per_sec: 0, jitter: 0.0 }
+        Self {
+            rtt: Duration::ZERO,
+            bytes_per_sec: 0,
+            jitter: 0.0,
+        }
     }
 }
 
@@ -100,18 +97,6 @@ pub struct SimStats {
     pub faults_injected: u64,
 }
 
-#[derive(Default)]
-struct Counters {
-    gets: AtomicU64,
-    not_modified: AtomicU64,
-    puts: AtomicU64,
-    cas_failures: AtomicU64,
-    deletes: AtomicU64,
-    bytes_uploaded: AtomicU64,
-    bytes_downloaded: AtomicU64,
-    faults_injected: AtomicU64,
-}
-
 /// Wraps any [`ObjectStore`] with seeded fault injection, a latency model,
 /// and operation counters. With everything at its default this is a
 /// transparent passthrough.
@@ -123,7 +108,7 @@ pub struct SimStore {
     /// contains this string executes and then reports an error.
     targeted: Mutex<Option<String>>,
     latency: Latency,
-    counters: Counters,
+    counters: Mutex<SimStats>,
 }
 
 impl SimStore {
@@ -134,7 +119,7 @@ impl SimStore {
             faults: Mutex::new(Faults::default()),
             targeted: Mutex::new(None),
             latency: Latency::default(),
-            counters: Counters::default(),
+            counters: Mutex::new(SimStats::default()),
         }
     }
 
@@ -161,17 +146,11 @@ impl SimStore {
     }
 
     pub fn stats(&self) -> SimStats {
-        let c = &self.counters;
-        SimStats {
-            gets: c.gets.load(Ordering::SeqCst),
-            not_modified: c.not_modified.load(Ordering::SeqCst),
-            puts: c.puts.load(Ordering::SeqCst),
-            cas_failures: c.cas_failures.load(Ordering::SeqCst),
-            deletes: c.deletes.load(Ordering::SeqCst),
-            bytes_uploaded: c.bytes_uploaded.load(Ordering::SeqCst),
-            bytes_downloaded: c.bytes_downloaded.load(Ordering::SeqCst),
-            faults_injected: c.faults_injected.load(Ordering::SeqCst),
-        }
+        *self.counters.lock().unwrap()
+    }
+
+    fn count(&self, bump: impl FnOnce(&mut SimStats)) {
+        bump(&mut self.counters.lock().unwrap());
     }
 
     fn pause(&self, transfer_bytes: usize) {
@@ -192,7 +171,7 @@ impl SimStore {
     fn roll_clean_fault(&self, what: &str, key: &str) -> Result<(), StoreError> {
         let p = self.faults.lock().unwrap().fail_clean;
         if self.rng.lock().unwrap().chance(p) {
-            self.counters.faults_injected.fetch_add(1, Ordering::SeqCst);
+            self.count(|c| c.faults_injected += 1);
             self.pause(0);
             return Err(StoreError(format!("simulated clean failure: {what} {key}")));
         }
@@ -202,21 +181,26 @@ impl SimStore {
     /// Whether a mutation that just executed should report failure anyway.
     fn roll_ambiguous_fault(&self, key: &str) -> bool {
         let mut targeted = self.targeted.lock().unwrap();
-        if targeted.as_ref().is_some_and(|part| key.contains(part.as_str())) {
+        if targeted
+            .as_ref()
+            .is_some_and(|part| key.contains(part.as_str()))
+        {
             *targeted = None;
-            self.counters.faults_injected.fetch_add(1, Ordering::SeqCst);
+            self.count(|c| c.faults_injected += 1);
             return true;
         }
         let p = self.faults.lock().unwrap().fail_ambiguous;
         if self.rng.lock().unwrap().chance(p) {
-            self.counters.faults_injected.fetch_add(1, Ordering::SeqCst);
+            self.count(|c| c.faults_injected += 1);
             return true;
         }
         false
     }
 
     fn ambiguous(what: &str, key: &str) -> StoreError {
-        StoreError(format!("simulated ambiguous failure: {what} {key} (op executed)"))
+        StoreError(format!(
+            "simulated ambiguous failure: {what} {key} (op executed)"
+        ))
     }
 }
 
@@ -224,9 +208,11 @@ impl ObjectStore for SimStore {
     fn get(&self, key: &str) -> Result<Option<Stored>, StoreError> {
         self.roll_clean_fault("get", key)?;
         let found = self.inner.get(key)?;
-        self.counters.gets.fetch_add(1, Ordering::SeqCst);
         let bytes = found.as_ref().map_or(0, |s| s.data.len());
-        self.counters.bytes_downloaded.fetch_add(bytes as u64, Ordering::SeqCst);
+        self.count(|c| {
+            c.gets += 1;
+            c.bytes_downloaded += bytes as u64;
+        });
         self.pause(bytes);
         Ok(found)
     }
@@ -235,20 +221,16 @@ impl ObjectStore for SimStore {
         self.roll_clean_fault("get", key)?;
         let got = self.inner.get_if_changed(key, etag)?;
         let bytes = match &got {
-            CondGet::Changed(s) => {
-                self.counters.gets.fetch_add(1, Ordering::SeqCst);
-                self.counters.bytes_downloaded.fetch_add(s.data.len() as u64, Ordering::SeqCst);
-                s.data.len()
-            }
-            CondGet::NotModified => {
-                self.counters.not_modified.fetch_add(1, Ordering::SeqCst);
-                0
-            }
-            CondGet::Missing => {
-                self.counters.gets.fetch_add(1, Ordering::SeqCst);
-                0
-            }
+            CondGet::Changed(s) => s.data.len(),
+            CondGet::NotModified | CondGet::Missing => 0,
         };
+        self.count(|c| {
+            match &got {
+                CondGet::NotModified => c.not_modified += 1,
+                CondGet::Changed(_) | CondGet::Missing => c.gets += 1,
+            }
+            c.bytes_downloaded += bytes as u64;
+        });
         self.pause(bytes);
         Ok(got)
     }
@@ -264,15 +246,15 @@ impl ObjectStore for SimStore {
         self.pause(data.len());
         match &outcome {
             CondPut::Ok { .. } => {
-                self.counters.puts.fetch_add(1, Ordering::SeqCst);
-                self.counters.bytes_uploaded.fetch_add(data.len() as u64, Ordering::SeqCst);
+                self.count(|c| {
+                    c.puts += 1;
+                    c.bytes_uploaded += data.len() as u64;
+                });
                 if self.roll_ambiguous_fault(key) {
                     return Err(Self::ambiguous("put", key));
                 }
             }
-            CondPut::PreconditionFailed => {
-                self.counters.cas_failures.fetch_add(1, Ordering::SeqCst);
-            }
+            CondPut::PreconditionFailed => self.count(|c| c.cas_failures += 1),
         }
         Ok(outcome)
     }
@@ -280,8 +262,10 @@ impl ObjectStore for SimStore {
     fn put(&self, key: &str, data: &[u8]) -> Result<String, StoreError> {
         self.roll_clean_fault("put", key)?;
         let etag = self.inner.put(key, data)?;
-        self.counters.puts.fetch_add(1, Ordering::SeqCst);
-        self.counters.bytes_uploaded.fetch_add(data.len() as u64, Ordering::SeqCst);
+        self.count(|c| {
+            c.puts += 1;
+            c.bytes_uploaded += data.len() as u64;
+        });
         self.pause(data.len());
         if self.roll_ambiguous_fault(key) {
             return Err(Self::ambiguous("put", key));
@@ -292,7 +276,7 @@ impl ObjectStore for SimStore {
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         self.roll_clean_fault("delete", key)?;
         self.inner.delete(key)?;
-        self.counters.deletes.fetch_add(1, Ordering::SeqCst);
+        self.count(|c| c.deletes += 1);
         self.pause(0);
         if self.roll_ambiguous_fault(key) {
             return Err(Self::ambiguous("delete", key));
@@ -327,7 +311,10 @@ mod tests {
         let run = || {
             let store = SimStore::new(Arc::new(MemoryStore::new())).with_faults(
                 42,
-                Faults { fail_clean: 0.3, fail_ambiguous: 0.2 },
+                Faults {
+                    fail_clean: 0.3,
+                    fail_ambiguous: 0.2,
+                },
             );
             (0..50)
                 .map(|i| store.put(&format!("k{i}"), b"v").is_ok())
