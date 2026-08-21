@@ -160,14 +160,14 @@ fn conflict_abort_hands_back_entry() {
     assert_eq!(a.write(b"set a 1".to_vec()).unwrap(), 0);
 
     let err = b.write(b"set b 2".to_vec()).unwrap_err();
-    let WalError::Conflict { entry } = err else {
+    let WalError::Conflict { entries } = err else {
         panic!("expected Conflict, got {err}")
     };
-    assert_eq!(entry, b"set b 2");
+    assert_eq!(entries, vec![b"set b 2".to_vec()]);
     // The refresh already folded in the winning write.
     assert_eq!(b.state().get("a").unwrap(), "1");
 
-    assert_eq!(b.write(entry).unwrap(), 1);
+    assert_eq!(b.write_batch(entries).unwrap(), 1..2);
     a.refresh().unwrap();
     assert_eq!(a.state(), b.state());
 }
@@ -525,14 +525,14 @@ fn write_retries_are_bounded_by_max_write_attempts() {
 
     store.conflict.store(true, Ordering::SeqCst);
     let err = w.write(b"set b 2".to_vec()).unwrap_err();
-    let WalError::Conflict { entry } = err else {
+    let WalError::Conflict { entries } = err else {
         panic!("expected Conflict, got {err}")
     };
-    assert_eq!(entry, b"set b 2");
+    assert_eq!(entries, vec![b"set b 2".to_vec()]);
     assert_eq!(store.attempts.load(Ordering::SeqCst), 3);
 
     store.conflict.store(false, Ordering::SeqCst);
-    assert_eq!(w.write(entry).unwrap(), 1);
+    assert_eq!(w.write_batch(entries).unwrap(), 1..2);
 }
 
 #[test]
@@ -564,4 +564,56 @@ fn corrupt_cache_is_ignored_on_open() {
     let s: Arc<dyn ObjectStore> = store.clone();
     let w = WalTier::open(s, Kv::new(), Options::new(dir.path())).unwrap();
     assert_eq!(w.state().get("a").unwrap(), "1");
+}
+
+#[test]
+fn write_batch_is_atomic_and_contiguous() {
+    let store = Arc::new(MemoryStore::new());
+    let (mut w, _d) = writer(&store, Kv::new());
+    assert_eq!(
+        w.write_batch(vec![]).unwrap(),
+        0..0,
+        "empty batch is a no-op"
+    );
+    let range = w
+        .write_batch(vec![
+            b"set a 1".to_vec(),
+            b"set b 2".to_vec(),
+            b"set a 3".to_vec(),
+        ])
+        .unwrap();
+    assert_eq!(range, 0..3);
+    assert_eq!(w.state().get("a").unwrap(), "3");
+    assert_eq!(w.tip(), Some(2));
+
+    // One PUT carried the whole batch, and a fresh open replays it.
+    let (w2, _d2) = writer(&store, Kv::new());
+    assert_eq!(w2.state(), w.state());
+    assert_eq!(store.keys(), vec!["wal".to_string()]);
+}
+
+#[test]
+fn write_batch_conflict_modes() {
+    let store = Arc::new(MemoryStore::new());
+    let (mut a, _da) = writer(&store, Kv::new());
+    let (mut b, _db) = writer(&store, Kv::new().on_conflict(OnConflict::Retry));
+
+    a.write(b"set a 1".to_vec()).unwrap();
+    // Retry mode: the stale batch lands transparently after the refresh.
+    let batch = vec![b"set b 2".to_vec(), b"set c 3".to_vec()];
+    assert_eq!(b.write_batch(batch).unwrap(), 1..3);
+
+    // Abort mode: the whole batch comes back, none of it applied.
+    let (mut c, _dc) = writer(&store, Kv::new());
+    a.refresh().unwrap();
+    a.write(b"set d 4".to_vec()).unwrap();
+    let batch = vec![b"set e 5".to_vec(), b"set f 6".to_vec()];
+    let err = c.write_batch(batch.clone()).unwrap_err();
+    let WalError::Conflict { entries } = err else {
+        panic!("expected Conflict, got {err}")
+    };
+    assert_eq!(entries, batch);
+    assert!(!c.state().contains_key("e"));
+    let range = c.write_batch(entries).unwrap();
+    assert_eq!(range.end - range.start, 2);
 }

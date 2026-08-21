@@ -149,6 +149,35 @@ fn bench_writes(cfg: &Cfg, payload: usize, compact_at: u64) {
     wal.close().unwrap();
 }
 
+/// Same 64B entries at different batch sizes: commits/s is pinned near
+/// 1/RTT, entries/s scales with the batch.
+fn bench_batched_writes(cfg: &Cfg) {
+    println!("group commit: 64B entries, compact every 256");
+    for batch in [1usize, 8, 64] {
+        let store = sim_store(cfg.latency);
+        let dir = TempDir::new().unwrap();
+        let s: Arc<dyn ObjectStore> = store.clone();
+        let mut wal =
+            WalTier::open(s, BlobKv { compact_at: 256 }, Options::new(dir.path())).unwrap();
+        let commits = (cfg.writes / 4).max(10);
+        let total = commits * batch;
+        let started = Instant::now();
+        for c in 0..commits {
+            let entries: Vec<Vec<u8>> = (0..batch)
+                .map(|i| entry_for((c * batch + i) as u32 % 1024, 64))
+                .collect();
+            wal.write_batch(entries).unwrap();
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "  batch={batch}: {total} entries in {:.2}s → {:.0} entries/s ({:.0} commits/s)",
+            elapsed.as_secs_f64(),
+            total as f64 / elapsed.as_secs_f64(),
+            commits as f64 / elapsed.as_secs_f64(),
+        );
+    }
+}
+
 /// No compaction: shows per-write cost growing with the image.
 fn bench_image_growth(cfg: &Cfg, payload: usize) {
     let store = sim_store(cfg.latency);
@@ -318,6 +347,7 @@ fn main() {
     };
     bench_writes(&cfg, 64, 64);
     bench_writes(&cfg, 4096, 64);
+    bench_batched_writes(&cfg);
     bench_image_growth(&cfg, 256);
     bench_open(&cfg);
     bench_replica(&cfg);

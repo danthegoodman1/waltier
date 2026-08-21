@@ -63,7 +63,9 @@ The image is its own manifest, so bootstrap is one GET. Entries are small metada
 
 - `Retry` — append unchanged at the new tip (right when your entries commute)
 - `Replace(bytes)` — append a rewritten entry instead
-- `Abort` (default) — you get `Conflict { entry }` back with your state already refreshed
+- `Abort` (default) — you get `Conflict { entries }` back with your state already refreshed
+
+`write_batch` commits many entries in one CAS PUT — atomically, each with its own LSN. Commits are serialized by the etag chain at roughly one per round trip (~40–70/s against S3), so batching is the throughput lever: buffer entries behind a channel and drain it into `write_batch`. `cargo run --release --example group_commit` demonstrates the pattern.
 
 ### Compaction
 

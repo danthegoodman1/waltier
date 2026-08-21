@@ -7,11 +7,13 @@ pub struct StoreError(pub String);
 
 #[derive(Debug, Error)]
 pub enum WalError {
-    /// The WAL changed under a write and the app declined to retry. The state
-    /// has been refreshed; `entry` is the pending entry, returned so the
-    /// caller can re-validate and resubmit.
+    /// The WAL changed under a write and the app declined to retry. The
+    /// state has been refreshed; `entries` are the pending entries (one for
+    /// `write`, the whole batch for `write_batch`, with any `Replace`
+    /// rewrites applied), returned so the caller can re-validate and
+    /// resubmit.
     #[error("write conflict: the WAL changed and the app declined to retry")]
-    Conflict { entry: Vec<u8> },
+    Conflict { entries: Vec<Vec<u8>> },
 
     #[error("storage: {0}")]
     Store(#[from] StoreError),

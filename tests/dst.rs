@@ -291,22 +291,30 @@ impl Sim {
         match self.rng.below(100) {
             0..55 => {
                 if self.writer_alive(wi, step) {
-                    let entry = self.payload();
+                    let n = 1 + self.rng.below(3) as usize;
+                    let batch: Vec<Vec<u8>> = (0..n).map(|_| self.payload()).collect();
                     let resubmit = self.rng.chance(0.5);
                     let w = self.writers[wi].instance.as_mut().unwrap();
-                    match w.write(entry.clone()) {
-                        Ok(lsn) => self.log(step, &format!("writer {wi} wrote lsn {lsn}")),
-                        Err(WalError::Conflict { entry: back }) => {
+                    match w.write_batch(batch.clone()) {
+                        Ok(range) => {
+                            assert_eq!(
+                                range.end - range.start,
+                                n as u64,
+                                "one LSN per batch entry"
+                            );
+                            self.log(step, &format!("writer {wi} wrote lsns {range:?}"));
+                        }
+                        Err(WalError::Conflict { entries: back }) => {
                             assert!(
                                 matches!(self.app.mode, Mode::Abort),
                                 "seed {}: only Abort mode may surface Conflict here",
                                 self.seed
                             );
-                            assert_eq!(back, entry, "Conflict must hand the entry back");
+                            assert_eq!(back, batch, "Conflict must hand the batch back");
                             self.log(step, &format!("writer {wi} conflict"));
                             if resubmit {
                                 let w = self.writers[wi].instance.as_mut().unwrap();
-                                let second = w.write(back);
+                                let second = w.write_batch(back);
                                 if !self.faults {
                                     second.expect("resubmit after refresh must succeed");
                                 } else {
@@ -477,13 +485,13 @@ impl Sim {
             let w = self.writers[wi].instance.as_mut().unwrap();
             match w.write(entry) {
                 Ok(_) => {}
-                Err(WalError::Conflict { entry }) => {
+                Err(WalError::Conflict { entries }) => {
                     // Abort mode: the refresh already reconciled; resubmit.
                     self.writers[wi]
                         .instance
                         .as_mut()
                         .unwrap()
-                        .write(entry)
+                        .write_batch(entries)
                         .unwrap();
                 }
                 Err(e) => panic!("seed {}: final write failed: {e}", self.seed),

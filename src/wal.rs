@@ -271,25 +271,60 @@ impl<A: WalApp> WalTier<A> {
     /// consults [`WalApp::reconcile`]; `Abort` surfaces as
     /// [`WalError::Conflict`] with the entry handed back.
     pub fn write(&mut self, entry: impl Into<Vec<u8>>) -> Result<Lsn, WalError> {
-        let mut entry = entry.into();
+        Ok(self.write_batch(vec![entry.into()])?.start)
+    }
+
+    /// Append a batch of entries in one commit. Returns their contiguous LSN
+    /// range. The batch is atomic — one CAS PUT carries all of it, so either
+    /// every entry lands or none does — and this is the throughput lever:
+    /// commits are serialized by the etag chain at roughly one per round
+    /// trip, but each commit can carry many entries.
+    ///
+    /// On an etag conflict the library refreshes the state, then consults
+    /// [`WalApp::reconcile`] for each entry in order against the committed
+    /// state (a `Replace` rewrite sticks); one `Abort` fails the whole batch
+    /// with [`WalError::Conflict`] handing the entries back. An empty batch
+    /// is a no-op.
+    pub fn write_batch(
+        &mut self,
+        mut entries: Vec<Vec<u8>>,
+    ) -> Result<std::ops::Range<Lsn>, WalError> {
         self.sync_compaction();
+        if entries.is_empty() {
+            let next = self.core.image.next_lsn();
+            return Ok(next..next);
+        }
+        let count = entries.len() as u64;
         let mut attempts = 0u32;
         loop {
-            let lsn = self.core.image.next_lsn();
-            if self.try_install(Some(&entry))? {
-                self.core.app.apply(&mut self.core.state, lsn, &entry);
-                self.core.image.entries.push_back(entry);
+            let first = self.core.image.next_lsn();
+            if self.try_install(&entries)? {
+                for (i, entry) in entries.into_iter().enumerate() {
+                    self.core
+                        .app
+                        .apply(&mut self.core.state, first + i as u64, &entry);
+                    self.core.image.entries.push_back(entry);
+                }
                 self.maybe_trigger_compaction();
-                return Ok(lsn);
+                return Ok(first..first + count);
             }
             attempts += 1;
             if attempts >= self.core.opts.max_write_attempts {
-                return Err(WalError::Conflict { entry });
+                return Err(WalError::Conflict { entries });
             }
-            match self.core.app.reconcile(&self.core.state, &entry) {
-                Reconcile::Retry => {}
-                Reconcile::Replace(e) => entry = e,
-                Reconcile::Abort => return Err(WalError::Conflict { entry }),
+            let mut aborted = false;
+            for entry in entries.iter_mut() {
+                match self.core.app.reconcile(&self.core.state, entry) {
+                    Reconcile::Retry => {}
+                    Reconcile::Replace(e) => *entry = e,
+                    Reconcile::Abort => {
+                        aborted = true;
+                        break;
+                    }
+                }
+            }
+            if aborted {
+                return Err(WalError::Conflict { entries });
             }
         }
     }
@@ -301,7 +336,7 @@ impl<A: WalApp> WalTier<A> {
         self.sync_compaction();
         let mut attempts = 0u32;
         while self.pending_fold.is_some() {
-            if self.try_install(None)? {
+            if self.try_install(&[])? {
                 break;
             }
             attempts += 1;
@@ -392,7 +427,7 @@ impl<A: WalApp> WalTier<A> {
     /// refreshes the state and re-checks the pending fold; the caller decides
     /// whether to try again. After a win the caller pushes `extra` into the
     /// image itself.
-    fn try_install(&mut self, extra: Option<&[u8]>) -> Result<bool, WalError> {
+    fn try_install(&mut self, extra: &[Vec<u8>]) -> Result<bool, WalError> {
         let data = match &self.pending_fold {
             Some(f) => {
                 debug_assert!(f.applies_to(&self.core.image));

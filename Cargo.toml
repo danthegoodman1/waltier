@@ -1,6 +1,6 @@
 [package]
 name = "waltier"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A tiered write-ahead log: memory, local disk, and S3, with etag-CAS fencing and user-defined compaction."
 license = "MIT"
@@ -25,6 +25,10 @@ url = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "group_commit"
+required-features = ["sim"]
 
 [[bench]]
 name = "wal"

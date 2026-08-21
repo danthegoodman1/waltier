@@ -63,7 +63,7 @@ impl WalImage {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        self.encode_view(None, 0, None)
+        self.encode_view(None, 0, &[])
     }
 
     /// Encode the image as it will look with `snapshot` overriding the
@@ -75,18 +75,18 @@ impl WalImage {
         &self,
         snapshot: Option<&SnapshotRef>,
         skip: usize,
-        extra: Option<&[u8]>,
+        extra: &[Vec<u8>],
     ) -> Vec<u8> {
         let snapshot = snapshot.or(self.snapshot.as_ref());
         let kept = self.entries.iter().skip(skip);
         let kept_bytes: usize = kept.clone().map(|e| 4 + e.len()).sum();
-        let count = self.entries.len() - skip + extra.map_or(0, |_| 1);
+        let count = self.entries.len() - skip + extra.len();
         let mut out = Vec::with_capacity(
             4 + 1
                 + snapshot.map_or(0, |s| 12 + s.key.len())
                 + 4
                 + kept_bytes
-                + extra.map_or(0, |e| 4 + e.len()),
+                + extra.iter().map(|e| 4 + e.len()).sum::<usize>(),
         );
         out.extend_from_slice(MAGIC);
         match snapshot {
@@ -103,7 +103,7 @@ impl WalImage {
             out.extend_from_slice(&(e.len() as u32).to_le_bytes());
             out.extend_from_slice(e);
         }
-        if let Some(e) = extra {
+        for e in extra {
             out.extend_from_slice(&(e.len() as u32).to_le_bytes());
             out.extend_from_slice(e);
         }
@@ -214,14 +214,14 @@ mod tests {
             key: "snap/k".into(),
             lsn: 1,
         };
-        let data = img.encode_view(Some(&sr), 2, Some(b"dd"));
+        let data = img.encode_view(Some(&sr), 2, &[b"dd".to_vec(), b"e".to_vec()]);
         assert_eq!(data.len(), data.capacity(), "capacity hint must be exact");
         let decoded = WalImage::decode(&data).unwrap();
         assert_eq!(decoded.snapshot, Some(sr));
         assert_eq!(decoded.first_lsn(), 2);
         assert_eq!(
             decoded.entries,
-            VecDeque::from(vec![b"c".to_vec(), b"dd".to_vec()])
+            VecDeque::from(vec![b"c".to_vec(), b"dd".to_vec(), b"e".to_vec()])
         );
     }
 
