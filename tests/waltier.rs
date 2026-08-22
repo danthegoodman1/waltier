@@ -134,6 +134,14 @@ fn snap_keys(store: &MemoryStore) -> Vec<String> {
         .collect()
 }
 
+fn cached_snapshots(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("snap-"))
+        .count()
+}
+
 #[test]
 fn lsn_sequence_and_reopen() {
     let store = Arc::new(MemoryStore::new());
@@ -281,6 +289,35 @@ fn replica_follows_and_restores_across_folds() {
     assert!(
         !r.refresh().unwrap(),
         "no change means a cheap NotModified poll"
+    );
+}
+
+/// Every snapshot a follower restores from is saved to the local cache, but
+/// only a writer installing its *own* fold ever removed one. A replica that
+/// keeps falling behind folds accumulated one file per fold, forever —
+/// including for objects long deleted from the store.
+#[test]
+fn follower_cache_keeps_only_the_live_snapshot() {
+    let store = Arc::new(MemoryStore::new());
+    let (mut w, _dw) = writer(&store, Kv::new());
+    let (mut r, dr) = replica(&store, Kv::new());
+
+    for round in 0..3 {
+        w.write(format!("set k{round} v").into_bytes()).unwrap();
+        assert!(w.compact_now());
+        assert!(w.wait_for_compaction(), "{:?}", w.last_compaction_error());
+        w.flush().unwrap();
+        // The image is snapshot-only now, so the replica is behind first_lsn
+        // and has to restore rather than replay.
+        assert!(r.refresh().unwrap());
+    }
+
+    assert_eq!(snap_keys(&store).len(), 1);
+    assert_eq!(r.state(), w.state());
+    assert_eq!(
+        cached_snapshots(dr.path()),
+        1,
+        "the follower must not keep snapshots the log has moved past"
     );
 }
 

@@ -155,7 +155,10 @@ impl<A: WalApp> Core<A> {
             let mut state = match &image.snapshot {
                 None => app.init(),
                 Some(sr) => match fetch_snapshot(&cache, store.as_ref(), &sr.key)? {
-                    Some(bytes) => app.restore(&bytes)?,
+                    Some(bytes) => {
+                        cache.retain_snapshot(&sr.key);
+                        app.restore(&bytes)?
+                    }
                     // Snapshot replaced under us; re-read the WAL.
                     None => continue,
                 },
@@ -218,6 +221,7 @@ impl<A: WalApp> Core<A> {
                     // Snapshot replaced under us; re-read the WAL.
                     continue;
                 };
+                self.cache.retain_snapshot(&sr.key);
                 let mut state = self.app.restore(&bytes)?;
                 for (lsn, entry) in remote.entries_from(sr.lsn + 1) {
                     self.app.apply(&mut state, lsn, entry);

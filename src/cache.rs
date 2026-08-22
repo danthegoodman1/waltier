@@ -76,4 +76,20 @@ impl Cache {
     pub fn remove_snapshot(&self, key: &str) {
         let _ = fs::remove_file(self.snap_path(key));
     }
+
+    /// Drop every cached snapshot except `keep`. Called once the log has
+    /// moved onto a new snapshot: the older ones are already gone from the
+    /// store and will never be read again.
+    pub fn retain_snapshot(&self, keep: &str) {
+        let keep = self.snap_path(keep);
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path != keep && entry.file_name().to_string_lossy().starts_with("snap-") {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
 }
