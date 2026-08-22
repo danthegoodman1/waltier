@@ -66,6 +66,15 @@ impl Fold {
     }
 }
 
+/// The outcome of one CAS attempt. A lost CAS carries whether the refresh
+/// that followed it actually moved: a store may report `PreconditionFailed`
+/// for mid-flight contention (S3's 409 `ConditionalRequestConflict`) with
+/// nothing committed, and there is nothing for the app to reconcile against.
+enum Attempt {
+    Installed,
+    Lost { changed: bool },
+}
+
 enum CompactOutcome {
     Done(Fold),
     Failed(String),
@@ -298,19 +307,27 @@ impl<A: WalApp> WalTier<A> {
         let mut attempts = 0u32;
         loop {
             let first = self.core.image.next_lsn();
-            if self.try_install(&entries)? {
-                for (i, entry) in entries.into_iter().enumerate() {
-                    self.core
-                        .app
-                        .apply(&mut self.core.state, first + i as u64, &entry);
-                    self.core.image.entries.push_back(entry);
+            let changed = match self.try_install(&entries)? {
+                Attempt::Installed => {
+                    for (i, entry) in entries.into_iter().enumerate() {
+                        self.core
+                            .app
+                            .apply(&mut self.core.state, first + i as u64, &entry);
+                        self.core.image.entries.push_back(entry);
+                    }
+                    self.maybe_trigger_compaction();
+                    return Ok(first..first + count);
                 }
-                self.maybe_trigger_compaction();
-                return Ok(first..first + count);
-            }
+                Attempt::Lost { changed } => changed,
+            };
             attempts += 1;
             if attempts >= self.core.opts.max_write_attempts {
                 return Err(WalError::Conflict { entries });
+            }
+            if !changed {
+                // Contention, not a conflict: nobody committed anything, so
+                // there is nothing to reconcile against. Retry as-is.
+                continue;
             }
             let mut aborted = false;
             for entry in entries.iter_mut() {
@@ -336,7 +353,7 @@ impl<A: WalApp> WalTier<A> {
         self.sync_compaction();
         let mut attempts = 0u32;
         while self.pending_fold.is_some() {
-            if self.try_install(&[])? {
+            if matches!(self.try_install(&[])?, Attempt::Installed) {
                 break;
             }
             attempts += 1;
@@ -423,11 +440,11 @@ impl<A: WalApp> WalTier<A> {
     }
 
     /// One CAS attempt: PUT the current image with any pending fold applied
-    /// and `extra` appended. Returns whether the PUT was accepted. A lost CAS
-    /// refreshes the state and re-checks the pending fold; the caller decides
-    /// whether to try again. After a win the caller pushes `extra` into the
-    /// image itself.
-    fn try_install(&mut self, extra: &[Vec<u8>]) -> Result<bool, WalError> {
+    /// and `extra` appended. A lost CAS refreshes the state and re-checks the
+    /// pending fold, and reports whether that refresh saw anything new; the
+    /// caller decides whether to try again. After a win the caller pushes
+    /// `extra` into the image itself.
+    fn try_install(&mut self, extra: &[Vec<u8>]) -> Result<Attempt, WalError> {
         let data = match &self.pending_fold {
             Some(f) => {
                 debug_assert!(f.applies_to(&self.core.image));
@@ -453,12 +470,12 @@ impl<A: WalApp> WalTier<A> {
             CondPut::Ok { etag } => {
                 self.core.record_image_put(etag, &data);
                 self.install_pending_fold();
-                Ok(true)
+                Ok(Attempt::Installed)
             }
             CondPut::PreconditionFailed => {
-                self.core.refresh()?;
+                let changed = self.core.refresh()?;
                 self.discard_superseded_fold();
-                Ok(false)
+                Ok(Attempt::Lost { changed })
             }
         }
     }

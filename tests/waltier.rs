@@ -535,6 +535,47 @@ fn write_retries_are_bounded_by_max_write_attempts() {
     assert_eq!(w.write_batch(entries).unwrap(), 1..2);
 }
 
+/// A store may report a lost CAS without anything having been committed: S3
+/// answers 409 `ConditionalRequestConflict` when two conditional writes
+/// collide mid-flight, and `S3Store` maps that onto `PreconditionFailed` so
+/// the caller re-pulls and retries. Nothing won, so `reconcile` must not run —
+/// an app that rewrites its entry to rebase onto the winners would rebase onto
+/// nothing, and the rewrite is what would get committed.
+#[test]
+fn spurious_cas_failure_does_not_reconcile() {
+    use std::sync::atomic::Ordering;
+    let store = Arc::new(ConflictStore {
+        inner: MemoryStore::new(),
+        conflict: false.into(),
+        attempts: 0.into(),
+    });
+    let dir = TempDir::new().unwrap();
+    let s: Arc<dyn ObjectStore> = store.clone();
+    let mut w = WalTier::open(
+        s,
+        Kv::new().on_conflict(OnConflict::Replace),
+        Options::new(dir.path()),
+    )
+    .unwrap();
+    w.write(b"set a 1".to_vec()).unwrap();
+
+    store.conflict.store(true, Ordering::SeqCst);
+    let err = w.write(b"set b 2".to_vec()).unwrap_err();
+    let WalError::Conflict { entries } = err else {
+        panic!("expected Conflict, got {err}")
+    };
+    assert_eq!(
+        entries,
+        vec![b"set b 2".to_vec()],
+        "the log never moved, so the entry must come back unrewritten"
+    );
+    assert_eq!(w.tip(), Some(0), "nothing was committed");
+
+    store.conflict.store(false, Ordering::SeqCst);
+    assert_eq!(w.write_batch(entries).unwrap(), 1..2);
+    assert_eq!(w.state().get("b").unwrap(), "2");
+}
+
 #[test]
 fn close_installs_a_pending_fold() {
     let store = Arc::new(MemoryStore::new());
