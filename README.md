@@ -78,14 +78,14 @@ Compaction is insert-triggered and never blocks writes. When `should_compact` fi
 ### The tiers
 
 - **Memory** — your `State`, built by applying entries in LSN order
-- **Local disk** — a warm-start cache of the image and snapshot, validated by etag on open
+- **Local disk** — a warm-start cache of the image and snapshot. The image is etag-validated on open, and every cache file carries a checksum, so a damaged one reads back as a miss and costs one extra download
 - **S3** — the durable copy and the arbiter of truth
 
 ## Failure semantics
 
 - A stale writer corrupts nothing — it loses CASes until it catches up.
 - An error can hide a PUT that landed (a timeout after S3 applied it). WalTier never applies unacked entries locally; the next refresh picks them up. A caller that resubmits appends a duplicate, so writes are **at-least-once** — make entries idempotent or catch duplicates in `reconcile`.
-- A crash between uploading a snapshot and installing it orphans one object; pair the `snap/` prefix with a lifecycle rule if that matters to you.
+- A crash between uploading a snapshot and installing it orphans one object. Sweep `snap/` against the key the current WAL image names — everything else under the prefix is garbage. An age-based lifecycle rule would delete the live snapshot on an idle log, so don't use one.
 
 ## Object stores
 

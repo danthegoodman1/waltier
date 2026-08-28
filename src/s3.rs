@@ -61,12 +61,19 @@ fn etag_of(resp: &ureq::Response) -> Result<String, StoreError> {
         .ok_or_else(|| StoreError("response is missing an ETag header".into()))
 }
 
-fn read_body(resp: ureq::Response) -> Result<Vec<u8>, StoreError> {
+fn read_body(key: &str, resp: ureq::Response) -> Result<Vec<u8>, StoreError> {
     let mut buf = Vec::new();
+    // One byte past the limit, so an oversized body is refused rather than
+    // silently truncated into something the app would try to restore.
     resp.into_reader()
-        .take(MAX_BODY)
+        .take(MAX_BODY + 1)
         .read_to_end(&mut buf)
-        .map_err(|e| StoreError(format!("read body: {e}")))?;
+        .map_err(|e| StoreError(format!("read body of {key}: {e}")))?;
+    if buf.len() as u64 > MAX_BODY {
+        return Err(StoreError(format!(
+            "GET {key}: body exceeds the {MAX_BODY} byte limit"
+        )));
+    }
     Ok(buf)
 }
 
@@ -96,7 +103,7 @@ impl ObjectStore for S3Store {
                 let etag = etag_of(&resp)?;
                 Ok(CondGet::Changed(Stored {
                     etag,
-                    data: read_body(resp)?,
+                    data: read_body(key, resp)?,
                 }))
             }
             Err(ureq::Error::Status(304, _)) => Ok(CondGet::NotModified),
