@@ -134,6 +134,26 @@ fn snap_keys(store: &MemoryStore) -> Vec<String> {
         .collect()
 }
 
+/// Cached snapshot files in a cache directory.
+fn cached_snapshots(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("snap-"))
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+fn cached_snapshot(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut paths = cached_snapshots(dir);
+    assert_eq!(paths.len(), 1, "expected exactly one cached snapshot");
+    paths.pop().unwrap()
+}
+
 #[test]
 fn lsn_sequence_and_reopen() {
     let store = Arc::new(MemoryStore::new());
@@ -550,20 +570,184 @@ fn close_installs_a_pending_fold() {
     assert_eq!(w2.state().get("b").unwrap(), "2");
 }
 
-/// A damaged local cache must never poison an open; the store copy wins.
+/// The cache is a warm-start optimization, so every way it can be damaged
+/// must read back as a miss and fall through to the store — including the
+/// case the etag cannot catch, where the file is fresh but its contents are
+/// torn. Without a checksum over the payload this open fails outright.
 #[test]
 fn corrupt_cache_is_ignored_on_open() {
     let store = Arc::new(MemoryStore::new());
     let dir = TempDir::new().unwrap();
     let s: Arc<dyn ObjectStore> = store.clone();
     let mut w = WalTier::open(s, Kv::new(), Options::new(dir.path())).unwrap();
-    w.write(b"set a 1".to_vec()).unwrap();
+    for (k, v) in [("a", "1"), ("b", "2"), ("c", "3")] {
+        w.write(format!("set {k} {v}").into_bytes()).unwrap();
+    }
+    let expected = w.state().clone();
     drop(w);
 
-    std::fs::write(dir.path().join("wal.cache"), b"\x02zzgarbage").unwrap();
+    let path = dir.path().join("wal.cache");
+    let good = std::fs::read(&path).unwrap();
+    let damaged = [
+        b"\x02zzgarbage".to_vec(),
+        good[..good.len() - 3].to_vec(),
+        [&good[..], b"trailing"].concat(),
+        {
+            let mut d = good.clone();
+            *d.last_mut().unwrap() ^= 1;
+            d
+        },
+    ];
+    for bytes in damaged {
+        std::fs::write(&path, &bytes).unwrap();
+        let s: Arc<dyn ObjectStore> = store.clone();
+        let w = WalTier::open(s, Kv::new(), Options::new(dir.path()))
+            .unwrap_or_else(|e| panic!("a damaged cache poisoned the open: {e}"));
+        assert_eq!(w.state(), &expected);
+    }
+}
+
+/// The snapshot half of the same contract. A torn cached snapshot must be a
+/// miss, not a fatal `restore` error, and not a silently short state.
+#[test]
+fn corrupt_cached_snapshot_is_ignored_on_open() {
+    let store = Arc::new(MemoryStore::new());
+    let dir = TempDir::new().unwrap();
     let s: Arc<dyn ObjectStore> = store.clone();
-    let w = WalTier::open(s, Kv::new(), Options::new(dir.path())).unwrap();
-    assert_eq!(w.state().get("a").unwrap(), "1");
+    let mut w = WalTier::open(s, Kv::new(), Options::new(dir.path())).unwrap();
+    for (k, v) in [("alpha", "1"), ("beta", "2"), ("gamma", "3")] {
+        w.write(format!("set {k} {v}").into_bytes()).unwrap();
+    }
+    assert!(w.compact_now());
+    assert!(w.wait_for_compaction());
+    w.flush().unwrap();
+    let expected = w.state().clone();
+    drop(w);
+
+    let path = cached_snapshot(dir.path());
+    let good = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &good[..good.len() - 3]).unwrap();
+
+    let s: Arc<dyn ObjectStore> = store.clone();
+    let w = WalTier::open(s, Kv::new(), Options::new(dir.path()))
+        .unwrap_or_else(|e| panic!("a damaged cached snapshot poisoned the open: {e}"));
+    assert_eq!(w.state(), &expected);
+}
+
+/// Compaction reads its base through the same cache, so a torn snapshot file
+/// must not wedge folding and let the image grow without bound.
+#[test]
+fn corrupt_cached_snapshot_does_not_poison_compaction() {
+    let store = Arc::new(MemoryStore::new());
+    let (mut w, dir) = writer(&store, Kv::new());
+    w.write(b"set a 1".to_vec()).unwrap();
+    assert!(w.compact_now());
+    assert!(w.wait_for_compaction());
+    w.flush().unwrap();
+
+    let path = cached_snapshot(dir.path());
+    let good = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &good[..good.len() - 3]).unwrap();
+
+    w.write(b"set b 2".to_vec()).unwrap();
+    assert!(w.compact_now());
+    assert!(w.wait_for_compaction());
+    w.flush().unwrap();
+    assert_eq!(w.last_compaction_error(), None);
+    assert_eq!(w.stats().snapshot_lsn, Some(1));
+    assert_eq!(w.stats().live_entries, 0);
+}
+
+/// A replica rebuilds from a new snapshot on every fold it fell behind. Each
+/// one it caches supersedes the last, so the disk tier must stay bounded
+/// instead of accumulating a file per fold forever.
+#[test]
+fn replica_cache_does_not_grow_across_folds() {
+    let store = Arc::new(MemoryStore::new());
+    let (mut w, _dw) = writer(&store, Kv::new());
+    let (mut r, dr) = replica(&store, Kv::new());
+
+    for round in 0..5 {
+        w.write(format!("set k{round} v{round}").into_bytes())
+            .unwrap();
+        assert!(w.compact_now());
+        assert!(w.wait_for_compaction());
+        w.flush().unwrap();
+        assert!(r.refresh().unwrap());
+        assert_eq!(
+            cached_snapshots(dr.path()).len(),
+            1,
+            "round {round}: the replica must keep only the snapshot it is on"
+        );
+    }
+    assert_eq!(r.state(), w.state());
+}
+
+/// Folds that land while an instance is down leave its cache pointing at a
+/// snapshot nobody references. Reopening must sweep them, or a cache dir that
+/// outlives many restarts holds a file per fold.
+#[test]
+fn reopen_sweeps_snapshots_cached_by_an_earlier_process() {
+    let store = Arc::new(MemoryStore::new());
+    let (mut a, da) = writer(&store, Kv::new());
+    a.write(b"set a 1".to_vec()).unwrap();
+    assert!(a.compact_now());
+    assert!(a.wait_for_compaction());
+    a.flush().unwrap();
+    assert_eq!(cached_snapshots(da.path()).len(), 1);
+    drop(a);
+
+    // The log moves on twice while that instance is down.
+    let (mut b, _db) = writer(&store, Kv::new());
+    for round in 0..2 {
+        b.write(format!("set k{round} v").into_bytes()).unwrap();
+        assert!(b.compact_now());
+        assert!(b.wait_for_compaction());
+        b.flush().unwrap();
+    }
+
+    let store_ref: Arc<dyn ObjectStore> = store.clone();
+    let a = WalTier::open(store_ref, Kv::new(), Options::new(da.path())).unwrap();
+    assert_eq!(a.state(), b.state());
+    assert_eq!(
+        cached_snapshots(da.path()).len(),
+        1,
+        "reopen must keep only the snapshot the image names"
+    );
+}
+
+/// When an install PUT lands but reports an error, the writer adopts its own
+/// snapshot on the next refresh. The one that snapshot replaced is then
+/// unreachable from the WAL, so it must be collected rather than left to
+/// accumulate in the bucket.
+#[test]
+#[cfg(feature = "sim")]
+fn ambiguous_fold_install_collects_the_previous_snapshot() {
+    let inner = Arc::new(MemoryStore::new());
+    let store = Arc::new(waltier::sim::SimStore::new(inner.clone()));
+    let dir = TempDir::new().unwrap();
+    let s: Arc<dyn ObjectStore> = store.clone();
+    let mut w = WalTier::open(s, Kv::new(), Options::new(dir.path())).unwrap();
+
+    w.write(b"set a 1".to_vec()).unwrap();
+    assert!(w.compact_now());
+    assert!(w.wait_for_compaction());
+    w.flush().unwrap();
+    assert_eq!(snap_keys(&inner).len(), 1);
+
+    w.write(b"set b 2".to_vec()).unwrap();
+    assert!(w.compact_now());
+    assert!(w.wait_for_compaction());
+    store.fail_next_mutation_ambiguously("wal");
+    w.flush().unwrap_err();
+    w.refresh().unwrap();
+
+    assert!(!w.has_pending_fold());
+    assert_eq!(w.stats().snapshot_lsn, Some(1), "the install landed");
+    assert_eq!(snap_keys(&inner).len(), 1, "the replaced snapshot is gone");
+    assert_eq!(cached_snapshots(dir.path()).len(), 1);
+    let (w2, _d2) = writer(&inner, Kv::new());
+    assert_eq!(w2.state(), w.state());
 }
 
 #[test]

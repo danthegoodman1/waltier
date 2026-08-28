@@ -71,6 +71,14 @@ enum CompactOutcome {
     Failed(String),
 }
 
+/// What a refresh did: whether the image advanced, and the snapshot ref it
+/// stopped pointing at. The superseded object is unreachable from the WAL,
+/// so a writer collects it; a replica only drops its cached copy.
+struct Refreshed {
+    changed: bool,
+    superseded: Option<SnapshotRef>,
+}
+
 struct CompactionTask {
     rx: mpsc::Receiver<CompactOutcome>,
     handle: JoinHandle<()>,
@@ -119,7 +127,11 @@ impl<A: WalApp> Core<A> {
     ) -> Result<Self, WalError> {
         let cache = Cache::new(&opts.cache_dir)?;
         let wal_key = opts.wal_key();
-        let cached = cache.load_wal();
+        // A cached image that no longer decodes is not offered as a cache
+        // entry at all, so the store copy is fetched instead.
+        let cached = cache
+            .load_wal()
+            .filter(|(_, image)| WalImage::decode(image).is_ok());
         for _ in 0..MAX_RACES {
             let stored = match store
                 .get_if_changed(&wal_key, cached.as_ref().map(|(e, _)| e.as_str()))?
@@ -139,6 +151,7 @@ impl<A: WalApp> Core<A> {
                 }
                 CondGet::Missing => {
                     let state = app.init();
+                    cache.retain_snapshot(None);
                     return Ok(Self {
                         app,
                         store,
@@ -173,6 +186,8 @@ impl<A: WalApp> Core<A> {
                 etag: None,
                 image_len: 0,
             };
+            core.cache
+                .retain_snapshot(core.image.snapshot.as_ref().map(|sr| sr.key.as_str()));
             core.record_image_put(stored.etag, &stored.data);
             return Ok(core);
         }
@@ -188,19 +203,24 @@ impl<A: WalApp> Core<A> {
         self.etag = Some(etag);
     }
 
-    /// Pull the latest WAL image and advance the state. Returns whether
-    /// anything changed. When entries we never applied have been folded away,
-    /// rebuilds the state from the snapshot.
-    fn refresh(&mut self) -> Result<bool, WalError> {
+    /// Pull the latest WAL image and advance the state. When entries we never
+    /// applied have been folded away, rebuilds the state from the snapshot,
+    /// and the snapshot the image leaves behind is dropped from the cache and
+    /// reported to the caller.
+    fn refresh(&mut self) -> Result<Refreshed, WalError> {
+        let unchanged = Refreshed {
+            changed: false,
+            superseded: None,
+        };
         let wal_key = self.opts.wal_key();
         for _ in 0..MAX_RACES {
             let stored = match self.store.get_if_changed(&wal_key, self.etag.as_deref())? {
-                CondGet::NotModified => return Ok(false),
+                CondGet::NotModified => return Ok(unchanged),
                 CondGet::Missing => {
                     if self.etag.is_some() {
                         return Err(WalError::Corrupt("wal object disappeared".into()));
                     }
-                    return Ok(false);
+                    return Ok(unchanged);
                 }
                 CondGet::Changed(s) => s,
             };
@@ -224,9 +244,21 @@ impl<A: WalApp> Core<A> {
                 }
                 self.state = state;
             }
+            let superseded = self.image.snapshot.clone().filter(|old| {
+                remote
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|new| new.key != old.key)
+            });
+            if let Some(old) = &superseded {
+                self.cache.remove_snapshot(&old.key);
+            }
             self.image = remote;
             self.record_image_put(stored.etag, &stored.data);
-            return Ok(true);
+            return Ok(Refreshed {
+                changed: true,
+                superseded,
+            });
         }
         Err(WalError::Corrupt(
             "refresh kept racing with concurrent compactions".into(),
@@ -351,9 +383,10 @@ impl<A: WalApp> WalTier<A> {
     /// changed.
     pub fn refresh(&mut self) -> Result<bool, WalError> {
         self.sync_compaction();
-        let changed = self.core.refresh()?;
+        let refreshed = self.core.refresh()?;
         self.discard_superseded_fold();
-        Ok(changed)
+        self.collect(refreshed.superseded);
+        Ok(refreshed.changed)
     }
 
     /// Start a compaction regardless of [`WalApp::should_compact`]. Returns
@@ -456,8 +489,9 @@ impl<A: WalApp> WalTier<A> {
                 Ok(true)
             }
             CondPut::PreconditionFailed => {
-                self.core.refresh()?;
+                let refreshed = self.core.refresh()?;
                 self.discard_superseded_fold();
+                self.collect(refreshed.superseded);
                 Ok(false)
             }
         }
@@ -485,6 +519,16 @@ impl<A: WalApp> WalTier<A> {
             self.core.cache.remove_snapshot(&old.key);
         }
         self.core.cache.save_snapshot(&f.key, &f.bytes);
+    }
+
+    /// Delete a snapshot object the WAL has stopped referencing — ours when
+    /// an install PUT landed but reported failure, or a remote writer's that
+    /// its own fold replaced. Idempotent: whoever folded may have collected
+    /// it already.
+    fn collect(&mut self, superseded: Option<SnapshotRef>) {
+        if let Some(sr) = superseded {
+            let _ = self.core.store.delete(&sr.key);
+        }
     }
 
     /// Method preamble: fold in a finished compaction and re-check the
@@ -642,7 +686,7 @@ impl<A: WalApp> Replica<A> {
     /// Pull the latest WAL image. Returns whether anything changed. Usually a
     /// single cheap conditional GET.
     pub fn refresh(&mut self) -> Result<bool, WalError> {
-        self.core.refresh()
+        Ok(self.core.refresh()?.changed)
     }
 
     pub fn state(&self) -> &A::State {
