@@ -555,6 +555,51 @@ fn write_retries_are_bounded_by_max_write_attempts() {
     assert_eq!(w.write_batch(entries).unwrap(), 1..2);
 }
 
+/// An install PUT can land and still report an error — a timeout after the
+/// store applied it. `install_pending_fold` never runs, so the snapshot the
+/// fold replaced is never deleted: the next refresh sees our own key installed
+/// and correctly keeps it, but nothing is left pointing at the old object.
+///
+/// This is not the crash orphan the README documents. No process died, and the
+/// object left behind is the formerly-live snapshot, not the uploaded one.
+#[cfg(feature = "sim")]
+#[test]
+fn unacked_install_still_collects_the_replaced_snapshot() {
+    use waltier::sim::SimStore;
+
+    let raw = Arc::new(MemoryStore::new());
+    let sim = Arc::new(SimStore::new(raw.clone()));
+    let dir = TempDir::new().unwrap();
+    let s: Arc<dyn ObjectStore> = sim.clone();
+    let mut w = WalTier::open(s, Kv::new(), Options::new(dir.path())).unwrap();
+
+    // A first fold, installed cleanly.
+    w.write(b"set a 1".to_vec()).unwrap();
+    assert!(w.compact_now());
+    assert!(w.wait_for_compaction(), "{:?}", w.last_compaction_error());
+    w.flush().unwrap();
+    assert_eq!(snap_keys(&raw).len(), 1);
+
+    // A second fold, whose install PUT lands but reports an error.
+    w.write(b"set b 2".to_vec()).unwrap();
+    assert!(w.compact_now());
+    assert!(w.wait_for_compaction(), "{:?}", w.last_compaction_error());
+    sim.fail_next_mutation_ambiguously("wal");
+    assert!(w.flush().is_err(), "the install surfaces as an error");
+    assert!(w.has_pending_fold(), "the writer does not know it landed");
+
+    // The store took it after all, and the writer reconciles its bookkeeping.
+    w.refresh().unwrap();
+    assert_eq!(w.stats().snapshot_lsn, Some(1));
+    assert!(!w.has_pending_fold());
+    assert_eq!(w.state().get("b").unwrap(), "2");
+    assert_eq!(
+        snap_keys(&raw).len(),
+        1,
+        "the superseded snapshot must not be left behind"
+    );
+}
+
 #[test]
 fn close_installs_a_pending_fold() {
     let store = Arc::new(MemoryStore::new());

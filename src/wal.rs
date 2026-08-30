@@ -55,6 +55,11 @@ struct Fold {
     key: String,
     lsn: Lsn,
     bytes: Arc<Vec<u8>>,
+    /// The snapshot this fold supersedes, captured when the install PUT is
+    /// built. `install_pending_fold` collects it when the PUT is acked; if the
+    /// PUT lands but reports an error, `discard_superseded_fold` has to,
+    /// because `install_pending_fold` never runs.
+    replaces: Option<String>,
 }
 
 impl Fold {
@@ -473,6 +478,9 @@ impl<A: WalApp> WalTier<A> {
             }
             None => self.core.image.encode_view(None, 0, extra),
         };
+        if let Some(f) = self.pending_fold.as_mut() {
+            f.replaces = self.core.image.snapshot.as_ref().map(|s| s.key.clone());
+        }
         let etag = self
             .core
             .etag
@@ -557,6 +565,14 @@ impl<A: WalApp> WalTier<A> {
         let f = self.pending_fold.take().expect("checked above");
         if installed {
             self.core.cache.save_snapshot(&f.key, &f.bytes);
+            // install_pending_fold never ran, so collect what the fold
+            // superseded here instead.
+            if let Some(old) = f.replaces
+                && old != f.key
+            {
+                let _ = self.core.store.delete(&old);
+                self.core.cache.remove_snapshot(&old);
+            }
         } else {
             let _ = self.core.store.delete(&f.key);
         }
@@ -663,6 +679,7 @@ fn run_compaction<A: WalApp>(
             key: snap_key,
             lsn: fold_lsn,
             bytes: Arc::new(snapshot),
+            replaces: None,
         }),
         Err(e) => CompactOutcome::Failed(e.to_string()),
     }
