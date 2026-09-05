@@ -131,8 +131,10 @@ impl WalApp for App {
     }
     fn restore(&self, bytes: &[u8]) -> Result<Self::State, WalError> {
         Ok(bytes
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| u64::from_le_bytes(*bytes))
             .collect())
     }
     fn compact(&self, base: Option<&[u8]>, entries: &[Entry]) -> Result<Vec<u8>, WalError> {

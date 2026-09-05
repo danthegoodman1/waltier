@@ -74,8 +74,8 @@ fn checksum_parts(total: usize, parts: &[&[u8]]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325_u64 ^ total as u64;
     let mut tail = [0u8; 8];
     let mut used = 0;
-    let word = |h: &mut u64, bytes: &[u8]| {
-        *h = (*h ^ u64::from_le_bytes(bytes.try_into().unwrap())).wrapping_mul(PRIME);
+    let word = |h: &mut u64, bytes: &[u8; 8]| {
+        *h = (*h ^ u64::from_le_bytes(*bytes)).wrapping_mul(PRIME);
         *h ^= *h >> 29;
     };
     for &part in parts {
@@ -90,11 +90,10 @@ fn checksum_parts(total: usize, parts: &[&[u8]]) -> u64 {
                 used = 0;
             }
         }
-        let mut chunks = remaining.chunks_exact(8);
-        for chunk in &mut chunks {
+        let (chunks, remainder) = remaining.as_chunks::<8>();
+        for chunk in chunks {
             word(&mut h, chunk);
         }
-        let remainder = chunks.remainder();
         tail[used..used + remainder.len()].copy_from_slice(remainder);
         used += remainder.len();
     }
@@ -467,13 +466,12 @@ mod tests {
         // Independent legacy checksum spelling anchors format compatibility.
         fn legacy(data: &[u8]) -> u64 {
             let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ data.len() as u64;
-            let mut chunks = data.chunks_exact(8);
-            for chunk in &mut chunks {
-                hash = (hash ^ u64::from_le_bytes(chunk.try_into().unwrap()))
-                    .wrapping_mul(0x0000_0100_0000_01B3);
+            let (chunks, remainder) = data.as_chunks::<8>();
+            for chunk in chunks {
+                hash = (hash ^ u64::from_le_bytes(*chunk)).wrapping_mul(0x0000_0100_0000_01B3);
                 hash ^= hash >> 29;
             }
-            for &byte in chunks.remainder() {
+            for &byte in remainder {
                 hash = (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01B3);
             }
             hash
