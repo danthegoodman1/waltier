@@ -65,6 +65,8 @@ Cold-open latency was slower in this run set (baseline 14.11–17.32 ms; candida
 
 For 4 KiB entries, explicit-flush caching reduced median append time from 1.0432 to 0.3045 ms in this local workload. Cache policy does not move durability to local disk: all acknowledgements still require the object-store CAS. Cached WAL checkpoints are validated by resource identity and ETag before reuse.
 
+The final code at `09d9e1c` changes the checksum's iterator spelling to typed array chunks for Rust 1.98 Clippy, preserving its words and trailing bytes. A separate three-run cache recheck on Rust 1.97 is recorded under `cache_recheck_after_ci_iterator_update` in the raw results. For 4 KiB entries, Disabled/EveryCommit/OnFlush measured p50 **0.3086/1.0428/0.2860 ms**, p99 **1.9763/2.4576/1.1341 ms**, and total **0.0992/0.2131/0.0953 s**. The comparison tables retain their original paired measurements; no additional speedup is attributed to this iterator change.
+
 ## Architecture decision
 
 **Keep the single CAS image for small metadata logs.** The principal case is 64-byte entries, batch64 and compaction every 1,024 entries, reaching about 70 KiB of live image. It meets the chosen simulation gate of at least 30,000 entries/s and p99 acknowledgement below 5 ms: the candidate measured **36,736 entries/s and 1.905 ms p99**. The batch256 exploration reaches about 280 KiB and measured 84,446 entries/s with 4.398 ms p99. These are measured workloads, not enforced performance limits or production SLOs.
