@@ -5,7 +5,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use crate::cache::Cache;
-use crate::image::{SnapshotRef, WalImage};
+use crate::image::{ImageLimits, SnapshotRef, WalImage, check_limit};
 use crate::store::{CondGet, CondPut, ObjectStore, Stored, unique_id};
 use crate::{Entry, Lsn, Reconcile, WalApp, WalError, WalStats};
 
@@ -21,6 +21,15 @@ pub struct Options {
     pub prefix: String,
     /// Bound on CAS attempts per `write` or `flush` call.
     pub max_write_attempts: u32,
+    /// Maximum encoded WAL body, including snapshot reference and framing.
+    /// Default: 64 MiB. Capped to the store's advertised object limit.
+    pub max_image_bytes: usize,
+    /// Maximum live entries independent of the application's compaction trigger.
+    /// Default: 1,000,000. Exhaustion rejects the entire append before CAS.
+    pub max_live_entries: usize,
+    /// Maximum snapshot body. Default: 256 MiB; capped to the store's limit.
+    /// All writers and readers of a log should use compatible limits.
+    pub max_snapshot_bytes: usize,
 }
 
 impl Options {
@@ -29,7 +38,37 @@ impl Options {
             cache_dir: cache_dir.into(),
             prefix: String::new(),
             max_write_attempts: 8,
+            max_image_bytes: 64 << 20,
+            max_live_entries: 1_000_000,
+            max_snapshot_bytes: 256 << 20,
         }
+    }
+
+    fn limits(&self) -> ImageLimits {
+        ImageLimits {
+            bytes: self.max_image_bytes,
+            entries: self.max_live_entries,
+        }
+    }
+
+    fn validate(&mut self, store: &dyn ObjectStore) -> Result<(), WalError> {
+        if let Some(limit) = store.max_object_bytes() {
+            self.max_image_bytes = self.max_image_bytes.min(limit);
+            self.max_snapshot_bytes = self.max_snapshot_bytes.min(limit);
+        }
+        if self.max_write_attempts == 0
+            || self.max_image_bytes < 9
+            || self.max_live_entries == 0
+            || self.max_live_entries > u32::MAX as usize
+            || self.max_snapshot_bytes == 0
+            || self.max_image_bytes > isize::MAX as usize
+            || self.max_snapshot_bytes > isize::MAX as usize
+        {
+            return Err(WalError::InvalidOptions(
+                "positive retry/count/snapshot budgets and an image budget of at least 9 bytes are required; counts must fit u32 and byte budgets must fit isize".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn wal_key(&self) -> String {
@@ -77,12 +116,15 @@ fn fetch_snapshot(
     cache: &Cache,
     store: &dyn ObjectStore,
     key: &str,
+    max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, WalError> {
-    if let Some(bytes) = cache.load_snapshot(key) {
+    if let Some(bytes) = cache.load_snapshot(key, max_bytes) {
+        check_limit("snapshot bytes", bytes.len(), max_bytes)?;
         return Ok(Some(bytes));
     }
     match store.get(key)? {
         Some(s) => {
+            check_limit("snapshot bytes", s.data.len(), max_bytes)?;
             cache.save_snapshot(key, &s.data);
             Ok(Some(s.data))
         }
@@ -109,9 +151,10 @@ impl<A: WalApp> Core<A> {
     fn open(
         store: Arc<dyn ObjectStore>,
         app: Arc<A>,
-        opts: Options,
+        mut opts: Options,
         create_if_missing: bool,
     ) -> Result<Self, WalError> {
+        opts.validate(store.as_ref())?;
         let wal_key = opts.wal_key();
         let cache = Cache::new(
             &opts.cache_dir,
@@ -121,48 +164,56 @@ impl<A: WalApp> Core<A> {
         // A cached image that no longer decodes is not offered as a cache
         // entry at all, so the store copy is fetched instead.
         let cached = cache
-            .load_wal()
-            .filter(|(_, image)| WalImage::decode(image).is_ok());
+            .load_wal(opts.max_image_bytes)
+            .filter(|(_, image)| WalImage::decode(image, opts.limits()).is_ok());
         for _ in 0..MAX_RACES {
-            let stored = match store
-                .get_if_changed(&wal_key, cached.as_ref().map(|(e, _)| e.as_str()))?
-            {
-                CondGet::NotModified => {
-                    let (etag, data) = cached.clone().expect("NotModified implies a cached copy");
-                    Stored { data, etag }
-                }
-                CondGet::Changed(s) => s,
-                CondGet::Missing if create_if_missing => {
-                    let data = WalImage::empty().encode();
-                    match store.put_if_match(&wal_key, None, &data)? {
-                        CondPut::Ok { etag } => Stored { data, etag },
-                        // Lost the creation race; re-read whoever won.
-                        CondPut::PreconditionFailed => continue,
+            let stored =
+                match store.get_if_changed(&wal_key, cached.as_ref().map(|(e, _)| e.as_str()))? {
+                    CondGet::NotModified => {
+                        let (etag, data) = cached.clone().ok_or_else(|| {
+                            WalError::Store(
+                                crate::StoreError::new("unconditional GET returned NotModified")
+                                    .with_context(crate::StoreOperation::Get, &wal_key, None)
+                                    .not_applied(),
+                            )
+                        })?;
+                        Stored { data, etag }
                     }
-                }
-                CondGet::Missing => {
-                    let state = app.init();
-                    cache.retain_snapshot(None);
-                    return Ok(Self {
-                        app,
-                        store,
-                        opts,
-                        cache,
-                        state,
-                        image: WalImage::empty(),
-                        etag: None,
-                        image_len: 0,
-                    });
-                }
-            };
-            let image = WalImage::decode(&stored.data)?;
+                    CondGet::Changed(s) => s,
+                    CondGet::Missing if create_if_missing => {
+                        let data = WalImage::empty().encode(opts.limits())?;
+                        match store.put_if_match(&wal_key, None, &data)? {
+                            CondPut::Ok { etag } => Stored { data, etag },
+                            // Lost the creation race; re-read whoever won.
+                            CondPut::PreconditionFailed => continue,
+                        }
+                    }
+                    CondGet::Missing => {
+                        let state = app.init();
+                        cache.retain_snapshot(None);
+                        return Ok(Self {
+                            app,
+                            store,
+                            opts,
+                            cache,
+                            state,
+                            image: WalImage::empty(),
+                            etag: None,
+                            image_len: 0,
+                        });
+                    }
+                };
+            let image = WalImage::decode(&stored.data, opts.limits())?;
             let mut state = match &image.snapshot {
                 None => app.init(),
-                Some(sr) => match fetch_snapshot(&cache, store.as_ref(), &sr.key)? {
-                    Some(bytes) => app.restore(&bytes)?,
-                    // Snapshot replaced under us; re-read the WAL.
-                    None => continue,
-                },
+                Some(sr) => {
+                    match fetch_snapshot(&cache, store.as_ref(), &sr.key, opts.max_snapshot_bytes)?
+                    {
+                        Some(bytes) => app.restore(&bytes)?,
+                        // Snapshot replaced under us; re-read the WAL.
+                        None => continue,
+                    }
+                }
             };
             for (lsn, entry) in image.entries_from(image.first_lsn()) {
                 app.apply(&mut state, lsn, entry);
@@ -206,7 +257,14 @@ impl<A: WalApp> Core<A> {
         let wal_key = self.opts.wal_key();
         for _ in 0..MAX_RACES {
             let stored = match self.store.get_if_changed(&wal_key, self.etag.as_deref())? {
-                CondGet::NotModified => return Ok(unchanged),
+                CondGet::NotModified if self.etag.is_some() => return Ok(unchanged),
+                CondGet::NotModified => {
+                    return Err(WalError::Store(
+                        crate::StoreError::new("unconditional GET returned NotModified")
+                            .with_context(crate::StoreOperation::Get, &wal_key, None)
+                            .not_applied(),
+                    ));
+                }
                 CondGet::Missing => {
                     if self.etag.is_some() {
                         return Err(WalError::Corrupt("wal object disappeared".into()));
@@ -215,7 +273,7 @@ impl<A: WalApp> Core<A> {
                 }
                 CondGet::Changed(s) => s,
             };
-            let remote = WalImage::decode(&stored.data)?;
+            let remote = WalImage::decode(&stored.data, self.opts.limits())?;
             let my_next = self.image.next_lsn();
             if remote.first_lsn() <= my_next {
                 for (lsn, entry) in remote.entries_from(my_next) {
@@ -225,7 +283,13 @@ impl<A: WalApp> Core<A> {
                 let sr = remote.snapshot.as_ref().ok_or_else(|| {
                     WalError::Corrupt("entries start past lsn 0 with no snapshot".into())
                 })?;
-                let Some(bytes) = fetch_snapshot(&self.cache, self.store.as_ref(), &sr.key)? else {
+                let Some(bytes) = fetch_snapshot(
+                    &self.cache,
+                    self.store.as_ref(),
+                    &sr.key,
+                    self.opts.max_snapshot_bytes,
+                )?
+                else {
                     // Snapshot replaced under us; re-read the WAL.
                     continue;
                 };
@@ -460,9 +524,14 @@ impl<A: WalApp> WalTier<A> {
                     key: f.key.clone(),
                     lsn: f.lsn,
                 };
-                self.core.image.encode_view(Some(&sr), skip, extra)
+                self.core
+                    .image
+                    .encode_view(Some(&sr), skip, extra, self.core.opts.limits())?
             }
-            None => self.core.image.encode_view(None, 0, extra),
+            None => self
+                .core
+                .image
+                .encode_view(None, 0, extra, self.core.opts.limits())?,
         };
         let etag = self
             .core
@@ -614,6 +683,7 @@ impl<A: WalApp> WalTier<A> {
             .tip()
             .expect("caller checked entries are nonempty");
         let snap_prefix = format!("{}snap/{fold_lsn:020}-", self.core.opts.prefix);
+        let max_snapshot_bytes = self.core.opts.max_snapshot_bytes;
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
             let _ = tx.send(run_compaction(
@@ -622,8 +692,8 @@ impl<A: WalApp> WalTier<A> {
                 cache,
                 base_key,
                 entries,
-                fold_lsn,
                 snap_prefix,
+                max_snapshot_bytes,
             ));
         });
         self.compaction = Some(CompactionTask { rx, handle });
@@ -636,12 +706,16 @@ fn run_compaction<A: WalApp>(
     cache: Cache,
     base_key: Option<String>,
     entries: Vec<Entry>,
-    fold_lsn: Lsn,
     snap_prefix: String,
+    max_snapshot_bytes: usize,
 ) -> CompactOutcome {
+    let fold_lsn = entries
+        .last()
+        .expect("compaction requires live entries")
+        .lsn;
     let base = match &base_key {
         None => None,
-        Some(key) => match fetch_snapshot(&cache, store.as_ref(), key) {
+        Some(key) => match fetch_snapshot(&cache, store.as_ref(), key, max_snapshot_bytes) {
             Ok(Some(bytes)) => Some(bytes),
             Ok(None) => {
                 return CompactOutcome::Failed(format!(
@@ -655,6 +729,9 @@ fn run_compaction<A: WalApp>(
         Ok(s) => s,
         Err(e) => return CompactOutcome::Failed(e.to_string()),
     };
+    if let Err(e) = check_limit("snapshot bytes", snapshot.len(), max_snapshot_bytes) {
+        return CompactOutcome::Failed(e.to_string());
+    }
     match publish_snapshot(store.as_ref(), &snapshot, || {
         unique_id().map(|id| format!("{snap_prefix}{id}"))
     }) {
@@ -676,19 +753,20 @@ fn publish_snapshot(
     mut next_key: impl FnMut() -> std::io::Result<String>,
 ) -> Result<String, crate::StoreError> {
     for _ in 0..MAX_RACES {
-        let key = next_key().map_err(|e| crate::StoreError(format!("snapshot ID: {e}")))?;
+        let key = next_key().map_err(|e| crate::StoreError::new(format!("snapshot ID: {e}")))?;
         match store.put_if_match(&key, None, snapshot) {
             Ok(CondPut::Ok { .. }) => return Ok(key),
             Ok(CondPut::PreconditionFailed) => continue,
-            Err(e) => {
-                return Err(crate::StoreError(format!(
-                    "snapshot upload {key} failed (possible orphan retained): {e}"
-                )));
+            Err(mut e) => {
+                e.message = format!("snapshot upload {key} failed (possible orphan retained): {e}");
+                e.operation.get_or_insert(crate::StoreOperation::Put);
+                e.key.get_or_insert(key);
+                return Err(e);
             }
         }
     }
-    Err(crate::StoreError(
-        "snapshot key collision budget exhausted".into(),
+    Err(crate::StoreError::new(
+        "snapshot key collision budget exhausted",
     ))
 }
 

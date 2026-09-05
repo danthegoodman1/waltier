@@ -111,7 +111,7 @@ Prevent unbounded storage waits and stop accepting images or snapshots the libra
 
 Scope:
 
-- **2A — Store contract and transport:** Specify atomic CAS and coherent reads, object-scoped validators, reserved keys, and durability on successful PUT. Add configurable S3 connection/read/write/request deadlines. Preserve HTTP status and operation context in structured errors and classify ambiguous mutations conservatively. Document DNS, user-callback, and custom-store limits instead of promising cancellation the synchronous API cannot enforce.
+- **2A — Store contract and transport:** Specify atomic CAS and coherent reads, object-scoped validators, reserved keys, and durability on successful PUT. Add configurable S3 connection and whole-request deadlines covering reads and uploads. Use two explicit knobs because ureq overrides separate idle read/write timers when an overall timeout is set. Preserve HTTP status and operation context in structured errors and classify ambiguous mutations conservatively. Document DNS, user-callback, and custom-store limits instead of promising cancellation the synchronous API cannot enforce.
 - **2B — Checked format and limits:** Validate snapshot LSN, next-LSN arithmetic, lengths, entry count, and total encoded size before mutating storage. Align PUT/GET limits for WAL images and snapshots. Bound decoded entry count/allocations as well as byte length. Use small configurable thresholds for tests; distinguish invalid stored data from a valid append rejected for size.
 - **2C — Compaction lag behavior:** Add a hard live-image budget independent of `should_compact`. Return explicit backpressure/limit errors before CAS when a fold is slow or repeatedly fails; preserve the accepted prefix and permit recovery after maintenance succeeds. Validate options, including zero retry budgets.
 
@@ -128,11 +128,11 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 2A: Store contract, S3 deadlines, structured storage errors | Missing: trait/configuration documentation, transport changes, and observable deadline behavior. |
-| Incomplete | Work | 2B: Checked encoding/decoding and compatible read/write limits | Missing: fallible validation before publication and allocation bounds. |
-| Incomplete | Work | 2C: Hard image budget and explicit overload behavior | Missing: limits independent of application compaction triggers and option validation. |
-| Incomplete | Test | Codec boundaries, HTTP conformance, and compaction-lag recovery | Missing: repository tests covering each Phase 2 boundary in debug/release as applicable. |
-| Incomplete | Gate | Accepted data is readable; network waits and growth are bounded | Missing: passing limit/deadline tests and baseline suites. |
+| Complete | Work | 2A: Store contract, S3 deadlines, structured storage errors | `S3Options`, contextual `StoreError` with conservative mutation outcomes; nine scripted HTTP tests in `tests/s3_transport.rs`; README documents synchronous transport limitations. |
+| Complete | Work | 2B: Checked encoding/decoding and compatible read/write limits | Fallible WTL1 codec, checked LSN/count/length arithmetic, bounded cache reads, and backend-capped acceptance/decode budgets. Debug/release codec and limit suites passed. |
+| Complete | Work | 2C: Hard image budget and explicit overload behavior | `Options` validation and ten `tests/limits.rs` cases, including held/failed compaction, exact limits, recovery, and invalid options before storage access. |
+| Complete | Test | Codec boundaries, HTTP conformance, and compaction-lag recovery | Six codec tests, ten limit/recovery tests, nine local HTTP tests, and cache boundary tests. HTTP tests used localhost only; actual S3 remains untested. |
+| Complete | Gate | Accepted data is readable; network waits and growth are bounded | Independent Phase 2 review approved. All-feature 77 tests, no-default 56, release codec 6 and limits 10, Clippy all-targets, and diff checks passed. Limits require compatible reader/writer configuration and are not a peak-process-memory guarantee. |
 
 ## Phase 3: Make batch and maintenance outcomes explicit
 

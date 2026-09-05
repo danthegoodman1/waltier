@@ -13,6 +13,7 @@ It's the generalized core of the pattern in [Cursor's "git at any scale"](https:
   - [Replicas](#replicas)
   - [The tiers](#the-tiers)
 - [Failure semantics](#failure-semantics)
+- [Resource limits](#resource-limits)
 - [Object stores](#object-stores)
 - [Testing](#testing)
 - [Benchmarks](#benchmarks)
@@ -89,15 +90,27 @@ Compaction is insert-triggered and never blocks writes. When `should_compact` fi
 - Orphan sweeping is supported **only offline**: stop new writes, drain or terminate every writer and compaction/publication request, and discard all old handles so no pending fold can later install. After that, reread the authoritative WAL, keep its referenced snapshot, delete other objects under that WAL’s `snap/` prefix, and reopen writers. A pending upload or fold is not garbage merely because the current WAL does not reference it. Rereading the WAL during an online sweep, or adding a minimum object age, does not make that sweep safe. Do not use age-based expiration: it can delete the live snapshot of an idle log.
 - Normal compaction may delete a snapshot proven superseded by an accepted WAL transition. A reader racing that deletion rereads the WAL and reconstructs from its newer snapshot. Local cache cleanup only removes disposable files.
 
+## Resource limits
+
+`Options` defaults to a **64 MiB encoded WAL image**, **1,000,000 live entries**, and **256 MiB snapshots**. Set `max_image_bytes`, `max_live_entries`, and `max_snapshot_bytes` for your workload. Image limits include framing and the snapshot reference, so leave room for a fold's reference as well as the live entries. Byte budgets are capped to `ObjectStore::max_object_bytes()` when the store advertises a smaller limit. Use compatible limits on every writer and replica; lowering a reader's limits below existing objects returns `LimitExceeded`.
+
+Every candidate image is checked before CAS. Exceeding an image/count budget rejects the **whole batch**, does not apply any of that batch locally or change acknowledged history, and returns `LimitExceeded` (a conflict refresh may already have advanced local state); it does not wait for a slow or failing compactor. Start or finish compaction, install its fold, and retry when space becomes available. Snapshots exceeding their budget are rejected before upload. These are acceptance/decoding budgets, not peak process-memory caps: S3 can buffer up to its own transport limit before the WAL applies a smaller limit, and FsStore/custom GETs return a fully allocated body. Application state, callback allocations, and caller-owned pending batches remain the application's responsibility. Cache reads enforce the configured byte budgets before loading the file body.
+
+`WTL1` remains compatible. Lengths/counts and LSN arithmetic are checked; malformed stored images return `Corrupt` in debug and release. LSNs run from 0 through `u64::MAX - 1`, reserving `u64::MAX` as the terminal next-LSN value; further appends return `LsnExhausted`. Zero retry budgets, zero entry/snapshot budgets, and image budgets smaller than the empty 9-byte image are invalid options.
+
 ## Object stores
 
 `ObjectStore` is the seam: conditional get, CAS put (`If-Match` / `If-None-Match: *`), plain put, delete.
 
-- `S3Store` (default feature `s3`) — sync HTTP via `rusty-s3` + `ureq`. Needs S3 conditional writes, which general-purpose buckets support in all regions.
+- `S3Store` (default feature `s3`) — sync HTTP via `rusty-s3` + `ureq`. Needs S3 conditional writes, which general-purpose buckets support in all regions. `S3Store::new` keeps the existing `S3Config` API; `new_with_options(config, S3Options)` configures transport budgets.
 - `MemoryStore` — an isolated in-memory resource for tests.
 - `FsStore` — a development backend with one atomic file per object (validator plus data), nonaliasing object paths, and an OS lock held for the store’s lifetime. Share an `Arc<FsStore>`; a second independent open of the root is rejected, including from another process. It requires Rust 1.89 or later for standard-library file locking. It does not fsync files or directories and does not promise power-loss durability. Existing directories using the old data-plus-`.etag` layout are rejected: use a fresh root or export/reimport data with the old version before upgrading. The authoritative `WTL1` object format is unchanged.
 
 Custom stores must implement atomic conditional replacement, coherent data/validator reads, and strong read-after-write behavior. Validators identify an object version, not a whole backend; identical content may repeat an ETag. Reserve WalTier’s WAL and snapshot keys from application mutations. Implement `cache_namespace()` with a stable identity for the backing resource to enable persistent caching, and forward it through wrappers. Its default `None` safely bypasses cached data; cache directory setup and stale-file cleanup may still occur. Built-in stores provide namespaces; S3 scopes them to endpoint, bucket, access-key identity, region, and addressing mode.
+
+`S3Options` defaults to a 10-second connection timeout, a 60-second request deadline, and a 1 GiB maximum body for **both GET and PUT** (including application payload objects). `connect_timeout` is capped to `request_timeout`; request deadlines must be positive and below the 300-second signing TTL. The request deadline covers response headers, response bodies, and upload progress. The upload checks elapsed time between 8 KiB chunks. DNS resolution and an already executing transport/TLS call cannot be forcibly cancelled and may overrun the nominal deadline; this blocking API does not promise hard cancellation. Custom stores must implement their own time and allocation bounds, and user callbacks must return; WalTier cannot interrupt them. Transport tests use a local HTTP server, with no real S3 credentials or service access.
+
+Storage failures expose `StoreError { message, operation, key, status, mutation_outcome }`; S3 preserves the operation, object key, and any received HTTP status. `MutationOutcome::Unknown` means a failed PUT or DELETE may have landed, including a successful PUT response missing its ETag. A conditional 409/412 returns `PreconditionFailed` so the WAL can refresh before retrying. Custom-store migration: replace `StoreError(message)` with `StoreError::new(message)`, whose default is conservatively **Unknown**; use `.not_applied()` only when the backend can prove it did not apply the mutation, and `.with_context(...)` to add operation/key/status. Forward `max_object_bytes()` through wrappers along with `cache_namespace()`.
 
 ## Testing
 

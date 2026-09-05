@@ -27,9 +27,9 @@ pub mod sim;
 mod store;
 mod wal;
 
-pub use error::{StoreError, WalError};
+pub use error::{MutationOutcome, StoreError, StoreOperation, WalError};
 #[cfg(feature = "s3")]
-pub use s3::{S3Config, S3Store};
+pub use s3::{S3Config, S3Options, S3Store};
 pub use store::{CondGet, CondPut, FsStore, MemoryStore, ObjectStore, Stored};
 pub use wal::{Options, Replica, WalTier};
 

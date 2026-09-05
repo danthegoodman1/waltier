@@ -4,7 +4,7 @@
 //! copy, so a damaged or missing cache only costs an extra download.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -79,8 +79,18 @@ fn checksum(data: &[u8]) -> u64 {
 
 /// The payload of a cache file, or `None` when the framing or the checksum
 /// disagrees with the bytes on disk.
-fn read_checked(path: &Path) -> Option<Vec<u8>> {
-    let data = fs::read(path).ok()?;
+fn read_checked(path: &Path, max_payload: usize) -> Option<Vec<u8>> {
+    let limit = max_payload.checked_add(HEADER)?;
+    let file = fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > limit as u64 {
+        return None;
+    }
+    // The file can change after metadata; bound the read itself too.
+    let mut data = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut data).ok()?;
+    if data.len() > limit {
+        return None;
+    }
     if data.len() < HEADER || &data[..4] != MAGIC {
         return None;
     }
@@ -129,11 +139,19 @@ impl Cache {
     }
 
     /// The cached WAL image and the etag it was fetched under.
-    pub fn load_wal(&self) -> Option<(String, Vec<u8>)> {
-        let data = self.load(&self.wal_path(), b"wal")?;
+    pub fn load_wal(&self, max_bytes: usize) -> Option<(String, Vec<u8>)> {
+        let data = self.load(
+            &self.wal_path(),
+            b"wal",
+            max_bytes.checked_add(2 + u16::MAX as usize)?,
+        )?;
         let n = u16::from_le_bytes([*data.first()?, *data.get(1)?]) as usize;
         let etag = String::from_utf8(data.get(2..2 + n)?.to_vec()).ok()?;
-        Some((etag, data[2 + n..].to_vec()))
+        let image = &data[2 + n..];
+        if image.len() > max_bytes {
+            return None;
+        }
+        Some((etag, image.to_vec()))
     }
 
     pub fn save_wal(&self, etag: &str, image: &[u8]) {
@@ -147,17 +165,22 @@ impl Cache {
         self.save(&self.wal_path(), b"wal", &payload);
     }
 
-    pub fn load_snapshot(&self, key: &str) -> Option<Vec<u8>> {
-        self.load(&self.snap_path(key), key.as_bytes())
+    pub fn load_snapshot(&self, key: &str, max_bytes: usize) -> Option<Vec<u8>> {
+        self.load(&self.snap_path(key), key.as_bytes(), max_bytes)
     }
 
     pub fn save_snapshot(&self, key: &str, data: &[u8]) {
         self.save(&self.snap_path(key), key.as_bytes(), data);
     }
 
-    fn load(&self, path: &Path, key: &[u8]) -> Option<Vec<u8>> {
+    fn load(&self, path: &Path, key: &[u8], max_data: usize) -> Option<Vec<u8>> {
         let identity = self.identity.as_ref()?;
-        let data = read_checked(path)?;
+        let max_payload = identity
+            .len()
+            .checked_add(8)?
+            .checked_add(key.len())?
+            .checked_add(max_data)?;
+        let data = read_checked(path, max_payload)?;
         let rest = data.strip_prefix(identity.as_slice())?;
         let key_len = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
         if key_len != key.len() as u64 {
@@ -214,18 +237,21 @@ mod tests {
     #[test]
     fn wal_and_snapshot_roundtrip() {
         let (c, _d) = cache();
-        assert_eq!(c.load_wal(), None);
+        assert_eq!(c.load_wal(4096), None);
         c.save_wal("\"etag-1\"", b"image bytes");
         assert_eq!(
-            c.load_wal(),
+            c.load_wal(4096),
             Some(("\"etag-1\"".to_string(), b"image bytes".to_vec()))
         );
 
-        assert_eq!(c.load_snapshot("snap/k"), None);
+        assert_eq!(c.load_snapshot("snap/k", 4096), None);
         c.save_snapshot("snap/k", b"snapshot bytes");
-        assert_eq!(c.load_snapshot("snap/k"), Some(b"snapshot bytes".to_vec()));
+        assert_eq!(
+            c.load_snapshot("snap/k", 4096),
+            Some(b"snapshot bytes".to_vec())
+        );
         c.remove_snapshot("snap/k");
-        assert_eq!(c.load_snapshot("snap/k"), None);
+        assert_eq!(c.load_snapshot("snap/k", 4096), None);
     }
 
     /// Every way a file can be damaged must read back as a miss, never as
@@ -237,8 +263,8 @@ mod tests {
         c.save_snapshot("snap/k", b"snapshot bytes");
         type Load<'a> = &'a dyn Fn() -> Option<Vec<u8>>;
         let load: [(PathBuf, Load); 2] = [
-            (c.wal_path(), &|| c.load_wal().map(|(_, image)| image)),
-            (c.snap_path("snap/k"), &|| c.load_snapshot("snap/k")),
+            (c.wal_path(), &|| c.load_wal(4096).map(|(_, image)| image)),
+            (c.snap_path("snap/k"), &|| c.load_snapshot("snap/k", 4096)),
         ];
 
         for (path, load) in load {
@@ -272,8 +298,8 @@ mod tests {
             fs::write(&path, &good).unwrap();
             assert!(load().is_some(), "{path:?} must survive being restored");
         }
-        assert!(c.load_wal().is_some());
-        assert!(c.load_snapshot("snap/k").is_some());
+        assert!(c.load_wal(4096).is_some());
+        assert!(c.load_snapshot("snap/k", 4096).is_some());
     }
 
     #[test]
@@ -284,14 +310,14 @@ mod tests {
             c.save_snapshot(key, key.as_bytes());
         }
         c.retain_snapshot(Some("snap/b"));
-        assert_eq!(c.load_snapshot("snap/a"), None);
-        assert_eq!(c.load_snapshot("snap/b"), Some(b"snap/b".to_vec()));
-        assert_eq!(c.load_snapshot("snap/c"), None);
-        assert!(c.load_wal().is_some(), "the image cache is untouched");
+        assert_eq!(c.load_snapshot("snap/a", 4096), None);
+        assert_eq!(c.load_snapshot("snap/b", 4096), Some(b"snap/b".to_vec()));
+        assert_eq!(c.load_snapshot("snap/c", 4096), None);
+        assert!(c.load_wal(4096).is_some(), "the image cache is untouched");
 
         c.retain_snapshot(None);
-        assert_eq!(c.load_snapshot("snap/b"), None);
-        assert!(c.load_wal().is_some());
+        assert_eq!(c.load_snapshot("snap/b", 4096), None);
+        assert!(c.load_wal(4096).is_some());
     }
 
     #[test]
@@ -306,15 +332,15 @@ mod tests {
             (None, "a/wal"),
         ] {
             let b = Cache::new(dir.path(), namespace, wal_key).unwrap();
-            assert_eq!(b.load_wal(), None);
-            assert_eq!(b.load_snapshot("snap/same"), None);
+            assert_eq!(b.load_wal(4096), None);
+            assert_eq!(b.load_snapshot("snap/same", 4096), None);
         }
         // Even a deliberately misplaced, checksum-valid record must miss.
         fs::copy(a.snap_path("snap/same"), a.snap_path("snap/different")).unwrap();
-        assert_eq!(a.load_snapshot("snap/different"), None);
+        assert_eq!(a.load_snapshot("snap/different", 4096), None);
         let unknown = Cache::new(dir.path(), None, "a/wal").unwrap();
         unknown.save_wal("same-etag", b"wrong");
-        assert_eq!(a.load_wal().unwrap().1, b"history-a");
+        assert_eq!(a.load_wal(4096).unwrap().1, b"history-a");
     }
 
     #[test]
@@ -330,10 +356,10 @@ mod tests {
                     for _ in 0..32 {
                         c.save_wal("same-etag", &payload);
                         c.save_snapshot("same-snapshot-key", &payload);
-                        if let Some((_, bytes)) = c.load_wal() {
+                        if let Some((_, bytes)) = c.load_wal(payload.len()) {
                             assert_eq!(bytes, payload);
                         }
-                        if let Some(bytes) = c.load_snapshot("same-snapshot-key") {
+                        if let Some(bytes) = c.load_snapshot("same-snapshot-key", payload.len()) {
                             assert_eq!(bytes, payload);
                         }
                     }
@@ -367,5 +393,27 @@ mod tests {
         assert_ne!(checksum(b"abcdefgh"), checksum(b"abcdefgi"));
         assert_ne!(checksum(b"abcdefghi"), checksum(b"abcdefgh"));
         assert_eq!(checksum(b"abcdefghij"), checksum(b"abcdefghij"));
+    }
+    #[test]
+    fn byte_budgets_reject_oversized_cache_files_and_allow_exact_bodies() {
+        let (c, _dir) = cache();
+        c.save_wal("etag", b"four");
+        assert_eq!(c.load_wal(4).unwrap().1, b"four");
+        assert!(c.load_wal(3).is_none());
+        c.save_snapshot("s", b"four");
+        assert_eq!(c.load_snapshot("s", 4).unwrap(), b"four");
+        assert!(c.load_snapshot("s", 3).is_none());
+        // A large sparse file is rejected from its metadata, without reading
+        // its body or allocating for its claimed size.
+        fs::File::create(c.snap_path("s"))
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+        assert!(c.load_snapshot("s", 4).is_none());
+        fs::File::create(c.wal_path())
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+        assert!(c.load_wal(4).is_none());
     }
 }

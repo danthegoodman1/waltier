@@ -70,6 +70,14 @@ pub trait ObjectStore: Send + Sync {
         None
     }
 
+    /// Maximum readable/writable object body, if the backend has one. WalTier
+    /// caps its image and snapshot budgets to this bound. Wrappers must forward
+    /// it. Custom stores must enforce their own allocation and network bounds;
+    /// the synchronous trait cannot interrupt a blocked implementation.
+    fn max_object_bytes(&self) -> Option<usize> {
+        None
+    }
+
     fn get(&self, key: &str) -> Result<Option<Stored>, StoreError>;
 
     /// Conditional read. `etag: None` behaves like `get`.
@@ -259,17 +267,17 @@ impl FsStore {
         let bytes = match fs::read(self.path(key)) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(StoreError(format!("read {key}: {e}"))),
+            Err(e) => return Err(StoreError::new(format!("read {key}: {e}"))),
         };
         // WFS2 + 32-byte random validator + 8-byte data length + data.
         if bytes.len() < 44
             || &bytes[..4] != b"WFS2"
             || u64::from_le_bytes(bytes[36..44].try_into().unwrap()) != (bytes.len() - 44) as u64
         {
-            return Err(StoreError(format!("invalid FsStore object: {key}")));
+            return Err(StoreError::new(format!("invalid FsStore object: {key}")));
         }
         let etag = String::from_utf8(bytes[4..36].to_vec())
-            .map_err(|_| StoreError(format!("invalid FsStore validator: {key}")))?;
+            .map_err(|_| StoreError::new(format!("invalid FsStore validator: {key}")))?;
         Ok(Some(Stored {
             data: bytes[44..].to_vec(),
             etag,
@@ -277,10 +285,10 @@ impl FsStore {
     }
 
     fn write_object(&self, key: &str, data: &[u8]) -> Result<String, StoreError> {
-        let etag = unique_id().map_err(|e| StoreError(format!("create validator: {e}")))?;
+        let etag = unique_id().map_err(|e| StoreError::new(format!("create validator: {e}")))?;
         let path = self.path(key);
         fs::create_dir_all(path.parent().expect("object has parent"))
-            .map_err(|e| StoreError(format!("prepare {key}: {e}")))?;
+            .map_err(|e| StoreError::new(format!("prepare {key}: {e}")))?;
         write_atomic(
             &path,
             &[
@@ -290,7 +298,7 @@ impl FsStore {
                 data,
             ],
         )
-        .map_err(|e| StoreError(format!("write {key}: {e}")))?;
+        .map_err(|e| StoreError::new(format!("write {key}: {e}")))?;
         Ok(etag)
     }
 }
@@ -333,7 +341,7 @@ impl ObjectStore for FsStore {
         if let Err(e) = fs::remove_file(self.path(key))
             && e.kind() != io::ErrorKind::NotFound
         {
-            return Err(StoreError(format!("delete {key}: {e}")));
+            return Err(StoreError::new(format!("delete {key}: {e}")));
         }
         Ok(())
     }
