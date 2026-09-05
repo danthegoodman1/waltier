@@ -35,3 +35,17 @@ required-features = ["sim"]
 name = "wal"
 harness = false
 required-features = ["sim"]
+
+[[bench]]
+name = "review"
+harness = false
+required-features = ["sim"]
+
+[[bench]]
+name = "resources"
+harness = false
+required-features = ["sim"]
+
+[[bench]]
+name = "cache"
+harness = false

@@ -64,15 +64,42 @@ fn write_atomic_with(
 
 /// Catches torn, truncated, and mangled cache files. Not cryptographic.
 fn checksum(data: &[u8]) -> u64 {
+    checksum_parts(data.len(), &[data])
+}
+
+/// Match the WTC2 checksum over concatenated bytes without allocating that
+/// concatenation. Carry at most seven bytes across slice boundaries.
+fn checksum_parts(total: usize, parts: &[&[u8]]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01B3;
-    let mut h = 0xcbf2_9ce4_8422_2325_u64 ^ data.len() as u64;
-    let mut chunks = data.chunks_exact(8);
-    for c in &mut chunks {
-        h = (h ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(PRIME);
-        h ^= h >> 29;
+    let mut h = 0xcbf2_9ce4_8422_2325_u64 ^ total as u64;
+    let mut tail = [0u8; 8];
+    let mut used = 0;
+    let word = |h: &mut u64, bytes: &[u8]| {
+        *h = (*h ^ u64::from_le_bytes(bytes.try_into().unwrap())).wrapping_mul(PRIME);
+        *h ^= *h >> 29;
+    };
+    for &part in parts {
+        let mut remaining = part;
+        if used > 0 {
+            let take = (8 - used).min(remaining.len());
+            tail[used..used + take].copy_from_slice(&remaining[..take]);
+            used += take;
+            remaining = &remaining[take..];
+            if used == 8 {
+                word(&mut h, &tail);
+                used = 0;
+            }
+        }
+        let mut chunks = remaining.chunks_exact(8);
+        for chunk in &mut chunks {
+            word(&mut h, chunk);
+        }
+        let remainder = chunks.remainder();
+        tail[used..used + remainder.len()].copy_from_slice(remainder);
+        used += remainder.len();
     }
-    for &b in chunks.remainder() {
-        h = (h ^ b as u64).wrapping_mul(PRIME);
+    for &byte in &tail[..used] {
+        h = (h ^ byte as u64).wrapping_mul(PRIME);
     }
     h
 }
@@ -103,12 +130,21 @@ fn read_checked(path: &Path, max_payload: usize) -> Option<Vec<u8>> {
     Some(payload.to_vec())
 }
 
-fn write_checked(path: &Path, payload: &[u8]) {
-    let mut header = Vec::with_capacity(HEADER);
-    header.extend_from_slice(MAGIC);
-    header.extend_from_slice(&checksum(payload).to_le_bytes());
-    header.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    let _ = write_atomic(path, &[&header, payload]);
+fn write_checked(path: &Path, parts: &[&[u8]]) {
+    let Some(total) = parts.iter().try_fold(0usize, |n, p| n.checked_add(p.len())) else {
+        return;
+    };
+    let mut header = [0; HEADER];
+    header[..4].copy_from_slice(MAGIC);
+    header[4..12].copy_from_slice(&checksum_parts(total, parts).to_le_bytes());
+    header[12..].copy_from_slice(&(total as u64).to_le_bytes());
+    let _ = write_atomic_with(path, |file| {
+        file.write_all(&header)?;
+        for part in parts {
+            file.write_all(part)?;
+        }
+        Ok(())
+    });
 }
 
 #[derive(Clone)]
@@ -118,13 +154,30 @@ pub(crate) struct Cache {
 }
 
 impl Cache {
-    pub fn new(dir: &Path, namespace: Option<&str>, wal_key: &str) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
-        Ok(Self {
+    pub fn disabled() -> Self {
+        Self {
+            dir: PathBuf::new(),
+            identity: None,
+        }
+    }
+
+    /// Cache failures are misses, including failure to prepare its directory.
+    /// Unknown namespaces must not inspect or modify the filesystem at all.
+    pub fn new(dir: &Path, namespace: Option<&str>, wal_key: &str) -> Self {
+        let Some(ns) = namespace else {
+            return Self::disabled();
+        };
+        if fs::create_dir_all(dir).is_err() {
+            return Self::disabled();
+        }
+        Self {
             dir: dir.to_path_buf(),
-            identity: namespace
-                .map(|ns| format!("{}:{ns}{}:{wal_key}", ns.len(), wal_key.len()).into_bytes()),
-        })
+            identity: Some(format!("{}:{ns}{}:{wal_key}", ns.len(), wal_key.len()).into_bytes()),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.identity.is_some()
     }
 
     fn wal_path(&self) -> PathBuf {
@@ -140,6 +193,7 @@ impl Cache {
 
     /// The cached WAL image and the etag it was fetched under.
     pub fn load_wal(&self, max_bytes: usize) -> Option<(String, Vec<u8>)> {
+        self.identity.as_ref()?;
         let data = self.load(
             &self.wal_path(),
             b"wal",
@@ -155,22 +209,29 @@ impl Cache {
     }
 
     pub fn save_wal(&self, etag: &str, image: &[u8]) {
+        if self.identity.is_none() {
+            return;
+        }
         if etag.len() > u16::MAX as usize {
             return;
         }
-        let mut payload = Vec::with_capacity(2 + etag.len() + image.len());
-        payload.extend_from_slice(&(etag.len() as u16).to_le_bytes());
-        payload.extend_from_slice(etag.as_bytes());
-        payload.extend_from_slice(image);
-        self.save(&self.wal_path(), b"wal", &payload);
+        self.save(
+            &self.wal_path(),
+            b"wal",
+            &[&(etag.len() as u16).to_le_bytes(), etag.as_bytes(), image],
+        );
     }
 
     pub fn load_snapshot(&self, key: &str, max_bytes: usize) -> Option<Vec<u8>> {
+        self.identity.as_ref()?;
         self.load(&self.snap_path(key), key.as_bytes(), max_bytes)
     }
 
     pub fn save_snapshot(&self, key: &str, data: &[u8]) {
-        self.save(&self.snap_path(key), key.as_bytes(), data);
+        if self.identity.is_none() {
+            return;
+        }
+        self.save(&self.snap_path(key), key.as_bytes(), &[data]);
     }
 
     fn load(&self, path: &Path, key: &[u8], max_data: usize) -> Option<Vec<u8>> {
@@ -189,25 +250,32 @@ impl Cache {
         Some(rest.get(8..)?.strip_prefix(key)?.to_vec())
     }
 
-    fn save(&self, path: &Path, key: &[u8], data: &[u8]) {
+    fn save(&self, path: &Path, key: &[u8], data: &[&[u8]]) {
         let Some(identity) = &self.identity else {
             return;
         };
-        let mut payload = Vec::with_capacity(identity.len() + 8 + key.len() + data.len());
-        payload.extend_from_slice(identity);
-        payload.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        payload.extend_from_slice(key);
-        payload.extend_from_slice(data);
-        write_checked(path, &payload);
+        let length = (key.len() as u64).to_le_bytes();
+        // Only the small list of borrowed slices is allocated, never the image
+        // or snapshot body. WTC2 identity and checksum coverage are unchanged.
+        let mut parts = Vec::with_capacity(3 + data.len());
+        parts.extend_from_slice(&[identity.as_slice(), &length, key]);
+        parts.extend_from_slice(data);
+        write_checked(path, &parts);
     }
 
     pub fn remove_snapshot(&self, key: &str) {
+        if self.identity.is_none() {
+            return;
+        }
         let _ = fs::remove_file(self.snap_path(key));
     }
 
     /// Drop every cached snapshot but `keep`. Run on open, so a directory a
     /// previous process left behind does not hold a file per fold forever.
     pub fn retain_snapshot(&self, keep: Option<&str>) {
+        if self.identity.is_none() {
+            return;
+        }
         let keep = keep.map(|k| self.snap_path(k));
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return;
@@ -231,7 +299,7 @@ mod tests {
 
     fn cache() -> (Cache, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        (Cache::new(dir.path(), Some("test"), "wal").unwrap(), dir)
+        (Cache::new(dir.path(), Some("test"), "wal"), dir)
     }
 
     #[test]
@@ -323,7 +391,7 @@ mod tests {
     #[test]
     fn cache_identity_covers_backend_wal_key_and_snapshot_key() {
         let dir = tempfile::tempdir().unwrap();
-        let a = Cache::new(dir.path(), Some("backend-a"), "a/wal").unwrap();
+        let a = Cache::new(dir.path(), Some("backend-a"), "a/wal");
         a.save_wal("same-etag", b"history-a");
         a.save_snapshot("snap/same", b"snapshot-a");
         for (namespace, wal_key) in [
@@ -331,14 +399,14 @@ mod tests {
             (Some("backend-a"), "b/wal"),
             (None, "a/wal"),
         ] {
-            let b = Cache::new(dir.path(), namespace, wal_key).unwrap();
+            let b = Cache::new(dir.path(), namespace, wal_key);
             assert_eq!(b.load_wal(4096), None);
             assert_eq!(b.load_snapshot("snap/same", 4096), None);
         }
         // Even a deliberately misplaced, checksum-valid record must miss.
         fs::copy(a.snap_path("snap/same"), a.snap_path("snap/different")).unwrap();
         assert_eq!(a.load_snapshot("snap/different", 4096), None);
-        let unknown = Cache::new(dir.path(), None, "a/wal").unwrap();
+        let unknown = Cache::new(dir.path(), None, "a/wal");
         unknown.save_wal("same-etag", b"wrong");
         assert_eq!(a.load_wal(4096).unwrap().1, b"history-a");
     }
@@ -351,7 +419,7 @@ mod tests {
                 let dir = dir.path();
                 scope.spawn(move || {
                     let key = format!("{n}/wal");
-                    let c = Cache::new(dir, Some("backend"), &key).unwrap();
+                    let c = Cache::new(dir, Some("backend"), &key);
                     let payload = vec![n as u8; 8192];
                     for _ in 0..32 {
                         c.save_wal("same-etag", &payload);
@@ -394,6 +462,45 @@ mod tests {
         assert_ne!(checksum(b"abcdefghi"), checksum(b"abcdefgh"));
         assert_eq!(checksum(b"abcdefghij"), checksum(b"abcdefghij"));
     }
+    #[test]
+    fn streaming_checksum_matches_wtc2_across_every_part_alignment() {
+        // Independent legacy checksum spelling anchors format compatibility.
+        fn legacy(data: &[u8]) -> u64 {
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ data.len() as u64;
+            let mut chunks = data.chunks_exact(8);
+            for chunk in &mut chunks {
+                hash = (hash ^ u64::from_le_bytes(chunk.try_into().unwrap()))
+                    .wrapping_mul(0x0000_0100_0000_01B3);
+                hash ^= hash >> 29;
+            }
+            for &byte in chunks.remainder() {
+                hash = (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            hash
+        }
+        let bytes: Vec<u8> = (0..97).collect();
+        for end in 0..=bytes.len() {
+            for split in 0..=end {
+                assert_eq!(
+                    checksum_parts(end, &[&bytes[..split], &[], &bytes[split..end]]),
+                    legacy(&bytes[..end])
+                );
+            }
+            let parts: Vec<&[u8]> = bytes[..end].chunks(3).collect();
+            assert_eq!(checksum_parts(end, &parts), legacy(&bytes[..end]));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for length in 0..16 {
+            let cache = Cache::new(dir.path(), Some(&"n".repeat(length)), "unaligned/wal");
+            cache.save_wal(&"e".repeat(length), &bytes);
+            assert_eq!(cache.load_wal(bytes.len()).unwrap().1, bytes);
+            let mut corrupted = fs::read(cache.wal_path()).unwrap();
+            *corrupted.last_mut().unwrap() ^= 1;
+            fs::write(cache.wal_path(), corrupted).unwrap();
+            assert!(cache.load_wal(bytes.len()).is_none());
+        }
+    }
+
     #[test]
     fn byte_budgets_reject_oversized_cache_files_and_allow_exact_bodies() {
         let (c, _dir) = cache();

@@ -406,6 +406,17 @@ impl Sim {
     /// Invariants, checked after every step via an oracle replica reading the
     /// raw (fault-free) store.
     fn check(&mut self, step: usize) {
+        // The baseline simulator explicitly services cleanup between steps.
+        // Separate barrier tests hold cleanup across foreground appends.
+        for slot in &mut self.writers {
+            if let Some(writer) = &mut slot.instance {
+                let result = writer.collect_garbage();
+                assert!(
+                    self.faults || result.is_ok(),
+                    "fault-free cleanup: {result:?}"
+                );
+            }
+        }
         let seed = self.seed;
         self.oracle
             .refresh()

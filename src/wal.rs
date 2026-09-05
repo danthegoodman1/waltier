@@ -1,5 +1,6 @@
 //! The writer ([`WalTier`]) and read-only follower ([`Replica`]).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -13,9 +14,23 @@ use crate::{Entry, Lsn, MutationOutcome, ReconcileBatch, WalApp, WalError, WalSt
 /// the snapshot mid-operation.
 const MAX_RACES: u32 = 8;
 
+/// Persistent cache writes are optional and never the durability point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    Disabled,
+    EveryCommit,
+    /// Save the WAL at explicit flush/close or `checkpoint_cache`. Snapshots
+    /// are still cached after fetch/upload; stale WAL checkpoints are validated.
+    OnFlush,
+}
+
 pub struct Options {
     /// Directory for the local warm-start cache (WAL image + snapshot).
     pub cache_dir: PathBuf,
+    pub cache_policy: CachePolicy,
+    /// Maximum obsolete snapshot identities retained for explicit deletion.
+    /// Overflow leaves safe orphans and increments the reported sweep debt.
+    pub max_pending_deletes: usize,
     /// Object-key prefix, e.g. `"logs/mylog/"`. The WAL lives at
     /// `{prefix}wal`, snapshots under `{prefix}snap/`.
     pub prefix: String,
@@ -32,15 +47,28 @@ pub struct Options {
     pub max_snapshot_bytes: usize,
 }
 
-impl Options {
-    pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
+impl Default for Options {
+    fn default() -> Self {
         Self {
-            cache_dir: cache_dir.into(),
+            cache_dir: PathBuf::new(),
+            cache_policy: CachePolicy::Disabled,
+            max_pending_deletes: 128,
             prefix: String::new(),
             max_write_attempts: 8,
             max_image_bytes: 64 << 20,
             max_live_entries: 1_000_000,
             max_snapshot_bytes: 256 << 20,
+        }
+    }
+}
+
+impl Options {
+    /// Enable best-effort caching at every observed image version.
+    pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            cache_dir: cache_dir.into(),
+            cache_policy: CachePolicy::EveryCommit,
+            ..Self::default()
         }
     }
 
@@ -80,7 +108,6 @@ impl Options {
 struct Fold {
     key: String,
     lsn: Lsn,
-    bytes: Arc<Vec<u8>>,
 }
 
 impl Fold {
@@ -106,6 +133,24 @@ pub enum CompactionStatus {
     Ready,
     Installed,
     Superseded,
+}
+
+/// Cleanup observations for this handle, not a global inventory of orphans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GarbageStatus {
+    pub pending: usize,
+    /// Cumulative candidates omitted because the queue was full. These require
+    /// an offline sweep after all handles and uploads have been drained.
+    /// Repeated candidates may be counted more than once.
+    pub overflowed: u64,
+    pub last_error: Option<String>,
+}
+
+/// Explicit maintenance drains tracked cleanup and reports any untracked debt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceStatus {
+    pub compaction: CompactionStatus,
+    pub garbage: GarbageStatus,
 }
 
 enum Compaction {
@@ -200,6 +245,7 @@ struct Core<A: WalApp> {
     /// `None` only on a replica opened before the WAL exists.
     etag: Option<String>,
     image_len: u64,
+    cache_dirty: bool,
 }
 
 impl<A: WalApp> Core<A> {
@@ -211,11 +257,14 @@ impl<A: WalApp> Core<A> {
     ) -> Result<Self, WalError> {
         opts.validate(store.as_ref())?;
         let wal_key = opts.wal_key();
-        let cache = Cache::new(
-            &opts.cache_dir,
-            store.cache_namespace().as_deref(),
-            &wal_key,
-        )?;
+        let cache = match opts.cache_policy {
+            CachePolicy::Disabled => Cache::disabled(),
+            _ => Cache::new(
+                &opts.cache_dir,
+                store.cache_namespace().as_deref(),
+                &wal_key,
+            ),
+        };
         // A cached image that no longer decodes is not offered as a cache
         // entry at all, so the store copy is fetched instead.
         let cached = cache
@@ -256,6 +305,7 @@ impl<A: WalApp> Core<A> {
                             image: WalImage::empty(),
                             etag: None,
                             image_len: 0,
+                            cache_dirty: false,
                         });
                     }
                 };
@@ -285,6 +335,7 @@ impl<A: WalApp> Core<A> {
                 image,
                 etag: None,
                 image_len: 0,
+                cache_dirty: false,
             };
             core.cache
                 .retain_snapshot(core.image.snapshot.as_ref().map(|sr| sr.key.as_str()));
@@ -299,9 +350,24 @@ impl<A: WalApp> Core<A> {
 
     /// The one place an accepted image version is recorded: cache, etag, size.
     fn record_image_put(&mut self, etag: String, data: &[u8]) {
-        self.cache.save_wal(&etag, data);
+        if self.opts.cache_policy == CachePolicy::EveryCommit {
+            self.cache.save_wal(&etag, data);
+        }
+        self.cache_dirty = self.opts.cache_policy == CachePolicy::OnFlush && self.cache.enabled();
         self.image_len = data.len() as u64;
         self.etag = Some(etag);
+    }
+
+    fn checkpoint_cache(&mut self) {
+        if !self.cache_dirty {
+            return;
+        }
+        if let Some(etag) = &self.etag
+            && let Ok(data) = self.image.encode(self.opts.limits())
+        {
+            self.cache.save_wal(etag, &data);
+            self.cache_dirty = false;
+        }
     }
 
     /// Pull the latest WAL image and advance the state. When entries we never
@@ -398,6 +464,9 @@ impl<A: WalApp> Core<A> {
 pub struct WalTier<A: WalApp> {
     core: Core<A>,
     compaction: Compaction,
+    garbage: VecDeque<String>,
+    garbage_overflowed: u64,
+    garbage_error: Option<String>,
 }
 
 impl<A: WalApp> WalTier<A> {
@@ -407,6 +476,9 @@ impl<A: WalApp> WalTier<A> {
         Ok(Self {
             core,
             compaction: Compaction::Idle,
+            garbage: VecDeque::new(),
+            garbage_overflowed: 0,
+            garbage_error: None,
         })
     }
 
@@ -498,15 +570,16 @@ impl<A: WalApp> WalTier<A> {
         unreachable!("options require a positive attempt budget")
     }
 
-    /// Wait for any running compaction and install its fold without appending.
-    /// Returns its explicit final state. CAS exhaustion is an error and retains
-    /// the ready fold for retry. Compactor failures remain errors until another
-    /// compaction is started; successful appends are not undone by them.
-    pub fn flush(&mut self) -> Result<CompactionStatus, WalError> {
+    /// Wait for compaction, install its fold, checkpoint cache and drain tracked
+    /// garbage. Returns the fold state and any untracked offline-sweep debt.
+    /// CAS exhaustion is an error and retains the ready fold for retry. Compactor failures remain errors until another
+    /// compaction is started; successful appends are not undone by them. Cleanup
+    /// errors may be returned after the fold has already been installed.
+    pub fn flush(&mut self) -> Result<MaintenanceStatus, WalError> {
         self.wait_for_compaction()?;
         for attempt in 1..=self.core.opts.max_write_attempts {
             if !self.has_pending_fold() {
-                return self.current_compaction_status();
+                break;
             }
             self.try_install(&[]).map_err(|error| error.source)?;
             if self.has_pending_fold() && attempt == self.core.opts.max_write_attempts {
@@ -516,7 +589,12 @@ impl<A: WalApp> WalTier<A> {
                 });
             }
         }
-        self.current_compaction_status()
+        self.core.checkpoint_cache();
+        let garbage = self.collect_garbage()?;
+        Ok(MaintenanceStatus {
+            compaction: self.current_compaction_status()?,
+            garbage,
+        })
     }
 
     /// Pull changes other instances have written. Returns whether anything
@@ -525,7 +603,7 @@ impl<A: WalApp> WalTier<A> {
         self.sync_compaction();
         let refreshed = self.core.refresh()?;
         self.discard_superseded_fold();
-        self.collect(refreshed.superseded);
+        self.queue_superseded(refreshed.superseded);
         Ok(refreshed.changed)
     }
 
@@ -573,13 +651,53 @@ impl<A: WalApp> WalTier<A> {
         })
     }
 
-    /// Wait for compaction and flush, then consume the handle even on error.
+    /// Wait for compaction and flush, returning the fold/cleanup report, then
+    /// consume the handle even on error. Inspect `garbage.overflowed` for debt.
     /// Use `flush(&mut self)` first when maintenance retries are wanted. A failed
     /// close never rolls back acknowledged appends; an uninstalled snapshot may
     /// remain as an orphan. Plain drop detaches a running compactor, which may
     /// finish its upload but cannot install a WAL reference.
-    pub fn close(mut self) -> Result<CompactionStatus, WalError> {
+    pub fn close(mut self) -> Result<MaintenanceStatus, WalError> {
         self.flush()
+    }
+
+    /// Best-effort checkpoint of the last observed WAL image for OnFlush.
+    /// Cache errors never affect committed history.
+    pub fn checkpoint_cache(&mut self) {
+        self.core.checkpoint_cache();
+    }
+
+    pub fn garbage_status(&self) -> GarbageStatus {
+        GarbageStatus {
+            pending: self.garbage.len(),
+            overflowed: self.garbage_overflowed,
+            last_error: self.garbage_error.clone(),
+        }
+    }
+
+    /// Delete queued, proven-obsolete snapshots. A failed DELETE remains queued
+    /// for retry, including ambiguous failures. Never called by append/refresh.
+    pub fn collect_garbage(&mut self) -> Result<GarbageStatus, crate::StoreError> {
+        while let Some(key) = self.garbage.front() {
+            if let Err(error) = self.core.store.delete(key) {
+                self.garbage_error = Some(error.to_string());
+                return Err(error);
+            }
+            self.garbage.pop_front();
+        }
+        self.garbage_error = None;
+        Ok(self.garbage_status())
+    }
+
+    fn queue_obsolete(&mut self, key: String) {
+        if self.garbage.contains(&key) {
+            return;
+        }
+        if self.garbage.len() == self.core.opts.max_pending_deletes {
+            self.garbage_overflowed = self.garbage_overflowed.saturating_add(1);
+        } else {
+            self.garbage.push_back(key);
+        }
     }
 
     /// Last observed committed prefix. Call `refresh` to observe newer commits.
@@ -677,15 +795,15 @@ impl<A: WalApp> WalTier<A> {
             CondPut::PreconditionFailed => {
                 let refreshed = self.core.refresh()?;
                 self.discard_superseded_fold();
-                self.collect(refreshed.superseded);
+                self.queue_superseded(refreshed.superseded);
                 Ok(false)
             }
         }
     }
 
     /// After a winning PUT that carried a fold: drop the folded entries, swap
-    /// the snapshot ref, garbage-collect the previous snapshot, and keep the
-    /// new bytes in the disk cache as the base for future compactions.
+    /// the snapshot ref and queue the previous snapshot for explicit cleanup.
+    /// The compactor already cached the new snapshot before reporting ready.
     fn install_pending_fold(&mut self) {
         if !self.has_pending_fold() {
             return;
@@ -705,19 +823,18 @@ impl<A: WalApp> WalTier<A> {
         if let Some(old) = old
             && old.key != f.key
         {
-            let _ = self.core.store.delete(&old.key);
             self.core.cache.remove_snapshot(&old.key);
+            self.queue_obsolete(old.key);
         }
-        self.core.cache.save_snapshot(&f.key, &f.bytes);
     }
 
-    /// Delete a snapshot object the WAL has stopped referencing — ours when
+    /// Queue a snapshot object the WAL has stopped referencing — ours when
     /// an install PUT landed but reported failure, or a remote writer's that
     /// its own fold replaced. Idempotent: whoever folded may have collected
     /// it already.
-    fn collect(&mut self, superseded: Option<SnapshotRef>) {
+    fn queue_superseded(&mut self, superseded: Option<SnapshotRef>) {
         if let Some(sr) = superseded {
-            let _ = self.core.store.delete(&sr.key);
+            self.queue_obsolete(sr.key);
         }
     }
 
@@ -731,7 +848,7 @@ impl<A: WalApp> WalTier<A> {
     /// Drop a pending fold the image has moved past. Normally a remote
     /// compaction won and our snapshot object is an orphan to delete. The
     /// exception: when the image references the fold's own key, our install
-    /// PUT landed even though it reported failure, so keep its bytes cached —
+    /// PUT landed even though it reported failure, so keep that snapshot —
     /// deleting it would destroy the live snapshot.
     fn discard_superseded_fold(&mut self) {
         let Compaction::Ready(f) = &self.compaction else {
@@ -754,10 +871,9 @@ impl<A: WalApp> WalTier<A> {
         let Compaction::Ready(f) = std::mem::replace(&mut self.compaction, status) else {
             unreachable!("checked ready")
         };
-        if installed {
-            self.core.cache.save_snapshot(&f.key, &f.bytes);
-        } else {
-            let _ = self.core.store.delete(&f.key);
+        if !installed {
+            self.core.cache.remove_snapshot(&f.key);
+            self.queue_obsolete(f.key);
         }
     }
 
@@ -890,11 +1006,12 @@ fn run_compaction<A: WalApp>(
     match publish_snapshot(store.as_ref(), &snapshot, || {
         unique_id().map(|id| format!("{snap_prefix}{id}"))
     }) {
-        Ok(key) => CompactOutcome::Done(Fold {
-            key,
-            lsn: fold_lsn,
-            bytes: Arc::new(snapshot),
-        }),
+        Ok(key) => {
+            // Publication is confirmed before caching. Finish the optional disk
+            // work on the compactor, then release its large snapshot allocation.
+            cache.save_snapshot(&key, &snapshot);
+            CompactOutcome::Done(Fold { key, lsn: fold_lsn })
+        }
         Err(e) => CompactOutcome::Failed(e.to_string()),
     }
 }
@@ -944,6 +1061,11 @@ impl<A: WalApp> Replica<A> {
     /// single cheap conditional GET.
     pub fn refresh(&mut self) -> Result<bool, WalError> {
         Ok(self.core.refresh()?.changed)
+    }
+
+    /// Best-effort checkpoint when using OnFlush on a read-only replica.
+    pub fn checkpoint_cache(&mut self) {
+        self.core.checkpoint_cache();
     }
 
     /// Last observed committed prefix. Call `refresh` to observe newer commits.

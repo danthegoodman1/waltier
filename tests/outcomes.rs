@@ -333,15 +333,15 @@ fn idle_ready_installed_and_superseded_are_explicit() {
     let store = Arc::new(ScriptStore::default());
     let (mut a, _da) = writer(&store, App::new(Mode::Retry));
     assert_eq!(a.wait_for_compaction().unwrap(), CompactionStatus::Idle);
-    assert_eq!(a.flush().unwrap(), CompactionStatus::Idle);
+    assert_eq!(a.flush().unwrap().compaction, CompactionStatus::Idle);
     a.write_batch(batch(0, 2)).unwrap();
     let (mut b, _db) = writer(&store, App::new(Mode::Retry));
     assert!(a.compact_now());
     assert!(b.compact_now());
     assert_eq!(a.wait_for_compaction().unwrap(), CompactionStatus::Ready);
     assert_eq!(b.wait_for_compaction().unwrap(), CompactionStatus::Ready);
-    assert_eq!(a.flush().unwrap(), CompactionStatus::Installed);
-    assert_eq!(b.flush().unwrap(), CompactionStatus::Superseded);
+    assert_eq!(a.flush().unwrap().compaction, CompactionStatus::Installed);
+    assert_eq!(b.flush().unwrap().compaction, CompactionStatus::Superseded);
     assert!(!b.has_pending_fold());
     assert_cold(&store, &[0, 1]);
 }
@@ -368,7 +368,7 @@ fn flush_exhaustion_preserves_the_ready_fold_for_retry() {
     assert_eq!(wal.compaction_status().unwrap(), CompactionStatus::Ready);
     assert!(wal.stats().snapshot_lsn.is_none());
     assert_cold(&store, &[0, 1]);
-    assert_eq!(wal.flush().unwrap(), CompactionStatus::Installed);
+    assert_eq!(wal.flush().unwrap().compaction, CompactionStatus::Installed);
     assert_eq!(wal.stats().snapshot_lsn, Some(1));
 }
 
@@ -404,12 +404,12 @@ fn compaction_failure_can_be_acknowledged_or_retried() {
     assert!(wal.compact_now());
     wal.wait_for_compaction().unwrap_err();
     assert!(wal.take_compaction_error().unwrap().contains("deliberate"));
-    assert_eq!(wal.flush().unwrap(), CompactionStatus::Idle);
+    assert_eq!(wal.flush().unwrap().compaction, CompactionStatus::Idle);
     assert!(wal.compact_now());
     wal.wait_for_compaction().unwrap_err();
     failure.store(0, Ordering::SeqCst);
     assert!(wal.compact_now(), "starting new work also clears the error");
-    assert_eq!(wal.close().unwrap(), CompactionStatus::Installed);
+    assert_eq!(wal.close().unwrap().compaction, CompactionStatus::Installed);
     assert_cold(&store, &[0, 1]);
 }
 
@@ -432,7 +432,7 @@ fn close_waits_for_running_compaction_then_installs_it() {
     assert_cold(&store, &[0, 1]);
     release_tx.send(()).unwrap();
     assert_eq!(
-        closing.join().unwrap().unwrap(),
+        closing.join().unwrap().unwrap().compaction,
         CompactionStatus::Installed
     );
     let dir = TempDir::new().unwrap();
@@ -544,7 +544,7 @@ fn automatic_trigger_preserves_failure_until_explicit_retry() {
     assert!(matches!(wal.flush(), Err(WalError::Compaction(_))));
     assert_cold(&store, &[0, 1]);
     assert!(wal.compact_now());
-    assert_eq!(wal.close().unwrap(), CompactionStatus::Installed);
+    assert_eq!(wal.close().unwrap().compaction, CompactionStatus::Installed);
 }
 
 #[test]

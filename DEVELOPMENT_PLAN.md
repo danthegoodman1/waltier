@@ -192,12 +192,12 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 4A: Bounded maintenance off the acknowledgement path | Missing: foreground operation-count proof, deletion scheduling, and backlog visibility. |
-| Incomplete | Work | 4B: Optional cache and measured copy/allocation reductions | Missing: cache policy implementation, recovery tests, and memory measurements. |
-| Incomplete | Work | 4C: Bounded group-commit example with producer results | Missing: queue bounds and failure/shutdown validation. |
-| Incomplete | Decision | 4D: Workload envelope and single-image/segmented-layout decision | Missing: explicit workload target, sustained measurements, and recorded tradeoffs. |
-| Incomplete | Test | Maintenance latency, cache policies, sustained folds, producer pressure | Missing: deterministic blocked-delete test and repeatable benchmark artifacts. |
-| Incomplete | Gate | One foreground CAS, bounded maintenance, evidenced architecture choice | Missing: operation counts, passing suites, and completed 4D decision. |
+| Complete | Work | 4A: Bounded maintenance off the acknowledgement path | Explicit deduplicated deletion queue, `collect_garbage`, status/failure/overflow reporting; blocked-delete test proves installing append acknowledges after one WAL CAS. |
+| Complete | Work | 4B: Optional cache and measured copy/allocation reductions | Disabled/EveryCommit/OnFlush policies, unavailable-cache recovery, streamed WTC2 writes and removal of retained fold bytes. Ready 16 MiB snapshot heap delta falls from about 32 to 16 MiB; peak heap is unchanged. |
+| Complete | Work | 4C: Bounded group-commit example with producer results | Queue capacity plus maximum entry size bound payload bytes; bounded batches/producer windows, durable receipts, failure and shutdown handling; three example tests pass. |
+| Complete | Decision | 4D: Workload envelope and single-image/segmented-layout decision | `PERFORMANCE.md` retains one image for the measured 64-byte/batch64/~70 KiB metadata target: 36,736 entries/s, p99 1.905 ms at simulated 1 ms RTT. Larger-image/lag costs and segmented tradeoffs are explicit. |
+| Complete | Test | Maintenance latency, cache policies, sustained folds, producer pressure | Eight `tests/maintenance.rs` regressions, cache compatibility test, three example tests; review/resources/cache benches, comparison script and three raw runs in `performance-results.json`. |
+| Complete | Gate | One foreground CAS, bounded maintenance, evidenced architecture choice | Independent Phase 4 review approved code and every performance median. All-feature 103, no-default 82, example tests 3, Clippy, formatting and diff checks pass. Fold p99 31.01→15.42 ms; unchanged total cleanup work and slower cold/startup results are reported. |
 
 ## Phase 5: Prove concurrent recovery independently
 

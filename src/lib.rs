@@ -31,7 +31,9 @@ pub use error::{MutationOutcome, StoreError, StoreOperation, WalError, WriteErro
 #[cfg(feature = "s3")]
 pub use s3::{S3Config, S3Options, S3Store};
 pub use store::{CondGet, CondPut, FsStore, MemoryStore, ObjectStore, Stored};
-pub use wal::{CompactionStatus, Options, Replica, WalTier};
+pub use wal::{
+    CachePolicy, CompactionStatus, GarbageStatus, MaintenanceStatus, Options, Replica, WalTier,
+};
 
 /// Log sequence number. Assigned by the library, starting at 0, contiguous.
 pub type Lsn = u64;

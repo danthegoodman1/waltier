@@ -1,0 +1,1023 @@
+{
+  "baseline": "d5dda89fb176d590d03c7812d047ced2712bba94",
+  "candidate_head": "fe6aed635e47a41d8c4aed0b7c15d79aa7f65343",
+  "candidate_tracked_changes": true,
+  "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+  "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.43",
+  "runs": {
+    "baseline": [
+      {
+        "fold_install_rtt15": {
+          "commits": 20.0,
+          "entries": 40.0,
+          "p50_ms": 30.4396,
+          "p99_ms": 30.6479,
+          "total_s": 1.2213,
+          "entries_s": 32.8,
+          "uploaded_bytes_per_entry": 169.5,
+          "gets": 0.0,
+          "puts": 60.0,
+          "deletes": 20.0
+        },
+        "steady_batch1_rtt1": {
+          "commits": 192.0,
+          "entries": 192.0,
+          "p50_ms": 1.0875,
+          "p99_ms": 1.2203,
+          "total_s": 0.2504,
+          "entries_s": 766.9,
+          "uploaded_bytes_per_entry": 643.9,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch8_rtt1": {
+          "commits": 192.0,
+          "entries": 1536.0,
+          "p50_ms": 1.1305,
+          "p99_ms": 1.1845,
+          "total_s": 0.2563,
+          "entries_s": 5993.8,
+          "uploaded_bytes_per_entry": 586.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 1.5125,
+          "p99_ms": 1.8806,
+          "total_s": 0.3317,
+          "entries_s": 37049.6,
+          "uploaded_bytes_per_entry": 579.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch256_rtt1": {
+          "commits": 192.0,
+          "entries": 49152.0,
+          "p50_ms": 2.7306,
+          "p99_ms": 4.2469,
+          "total_s": 0.5765,
+          "entries_s": 85253.2,
+          "uploaded_bytes_per_entry": 578.3,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt0": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 0.0276,
+          "p99_ms": 0.0895,
+          "total_s": 0.0102,
+          "entries_s": 1209944.0,
+          "uploaded_bytes_per_entry": 579.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1_entry4096": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 26.8821,
+          "p99_ms": 51.3224,
+          "total_s": 5.2582,
+          "entries_s": 2336.9,
+          "uploaded_bytes_per_entry": 34851.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "lag_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 2.2891,
+          "p99_ms": 2.7223,
+          "total_s": 0.4876,
+          "entries_s": 25198.6,
+          "uploaded_bytes_per_entry": 1650.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "snapshot16m": {
+          "pending_heap_delta": 33554631.0,
+          "compaction_peak_delta": 33653794.0,
+          "cold_open_ms": 14.8493
+        },
+        "live16m": {
+          "start_ms": 3.731,
+          "held_heap_delta": 16909111.0,
+          "startup_peak_delta": 16909135.0
+        }
+      },
+      {
+        "fold_install_rtt15": {
+          "commits": 20.0,
+          "entries": 40.0,
+          "p50_ms": 30.5274,
+          "p99_ms": 31.1139,
+          "total_s": 1.2264,
+          "entries_s": 32.6,
+          "uploaded_bytes_per_entry": 169.5,
+          "gets": 0.0,
+          "puts": 60.0,
+          "deletes": 20.0
+        },
+        "steady_batch1_rtt1": {
+          "commits": 192.0,
+          "entries": 192.0,
+          "p50_ms": 1.0863,
+          "p99_ms": 1.225,
+          "total_s": 0.2497,
+          "entries_s": 769.1,
+          "uploaded_bytes_per_entry": 643.9,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch8_rtt1": {
+          "commits": 192.0,
+          "entries": 1536.0,
+          "p50_ms": 1.1303,
+          "p99_ms": 1.2107,
+          "total_s": 0.2573,
+          "entries_s": 5969.9,
+          "uploaded_bytes_per_entry": 586.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 1.4791,
+          "p99_ms": 1.882,
+          "total_s": 0.3308,
+          "entries_s": 37144.4,
+          "uploaded_bytes_per_entry": 579.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch256_rtt1": {
+          "commits": 192.0,
+          "entries": 49152.0,
+          "p50_ms": 2.7828,
+          "p99_ms": 4.2884,
+          "total_s": 0.5789,
+          "entries_s": 84912.4,
+          "uploaded_bytes_per_entry": 578.3,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt0": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 0.0298,
+          "p99_ms": 0.0918,
+          "total_s": 0.0105,
+          "entries_s": 1170070.4,
+          "uploaded_bytes_per_entry": 579.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1_entry4096": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 26.9504,
+          "p99_ms": 51.2063,
+          "total_s": 5.307,
+          "entries_s": 2315.4,
+          "uploaded_bytes_per_entry": 34851.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "lag_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 2.234,
+          "p99_ms": 2.6527,
+          "total_s": 0.4782,
+          "entries_s": 25694.5,
+          "uploaded_bytes_per_entry": 1650.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "snapshot16m": {
+          "pending_heap_delta": 33554631.0,
+          "compaction_peak_delta": 33653794.0,
+          "cold_open_ms": 14.1126
+        },
+        "live16m": {
+          "start_ms": 3.5714,
+          "held_heap_delta": 16909111.0,
+          "startup_peak_delta": 16909135.0
+        }
+      },
+      {
+        "fold_install_rtt15": {
+          "commits": 20.0,
+          "entries": 40.0,
+          "p50_ms": 30.5111,
+          "p99_ms": 31.0133,
+          "total_s": 1.2256,
+          "entries_s": 32.6,
+          "uploaded_bytes_per_entry": 169.5,
+          "gets": 0.0,
+          "puts": 60.0,
+          "deletes": 20.0
+        },
+        "steady_batch1_rtt1": {
+          "commits": 192.0,
+          "entries": 192.0,
+          "p50_ms": 1.0864,
+          "p99_ms": 1.4469,
+          "total_s": 0.2536,
+          "entries_s": 757.2,
+          "uploaded_bytes_per_entry": 643.9,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch8_rtt1": {
+          "commits": 192.0,
+          "entries": 1536.0,
+          "p50_ms": 1.1377,
+          "p99_ms": 1.2976,
+          "total_s": 0.2603,
+          "entries_s": 5900.6,
+          "uploaded_bytes_per_entry": 586.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 1.487,
+          "p99_ms": 1.8712,
+          "total_s": 0.3307,
+          "entries_s": 37159.5,
+          "uploaded_bytes_per_entry": 579.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch256_rtt1": {
+          "commits": 192.0,
+          "entries": 49152.0,
+          "p50_ms": 2.7985,
+          "p99_ms": 4.3008,
+          "total_s": 0.5799,
+          "entries_s": 84752.5,
+          "uploaded_bytes_per_entry": 578.3,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt0": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 0.023,
+          "p99_ms": 0.0427,
+          "total_s": 0.0074,
+          "entries_s": 1670223.1,
+          "uploaded_bytes_per_entry": 579.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1_entry4096": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 26.8152,
+          "p99_ms": 51.325,
+          "total_s": 5.287,
+          "entries_s": 2324.2,
+          "uploaded_bytes_per_entry": 34851.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "lag_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 2.2283,
+          "p99_ms": 2.6411,
+          "total_s": 0.4768,
+          "entries_s": 25772.0,
+          "uploaded_bytes_per_entry": 1650.0,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "snapshot16m": {
+          "pending_heap_delta": 33554631.0,
+          "compaction_peak_delta": 33653794.0,
+          "cold_open_ms": 17.3167
+        },
+        "live16m": {
+          "start_ms": 3.7422,
+          "held_heap_delta": 16909111.0,
+          "startup_peak_delta": 16909135.0
+        }
+      }
+    ],
+    "candidate": [
+      {
+        "fold_install_rtt15": {
+          "commits": 20.0,
+          "entries": 40.0,
+          "p50_ms": 15.1602,
+          "p99_ms": 15.4784,
+          "total_s": 1.225,
+          "entries_s": 32.7,
+          "uploaded_bytes_per_entry": 183.3,
+          "gets": 0.0,
+          "puts": 60.0,
+          "deletes": 20.0
+        },
+        "steady_batch1_rtt1": {
+          "commits": 192.0,
+          "entries": 192.0,
+          "p50_ms": 1.0917,
+          "p99_ms": 1.2784,
+          "total_s": 0.2553,
+          "entries_s": 752.0,
+          "uploaded_bytes_per_entry": 656.6,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch8_rtt1": {
+          "commits": 192.0,
+          "entries": 1536.0,
+          "p50_ms": 1.1356,
+          "p99_ms": 1.1899,
+          "total_s": 0.2582,
+          "entries_s": 5949.2,
+          "uploaded_bytes_per_entry": 587.8,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 1.523,
+          "p99_ms": 1.9052,
+          "total_s": 0.336,
+          "entries_s": 36576.7,
+          "uploaded_bytes_per_entry": 579.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch256_rtt1": {
+          "commits": 192.0,
+          "entries": 49152.0,
+          "p50_ms": 2.7589,
+          "p99_ms": 4.3653,
+          "total_s": 0.5823,
+          "entries_s": 84412.6,
+          "uploaded_bytes_per_entry": 578.3,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt0": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 0.0447,
+          "p99_ms": 0.0963,
+          "total_s": 0.014,
+          "entries_s": 878486.0,
+          "uploaded_bytes_per_entry": 579.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1_entry4096": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 25.6197,
+          "p99_ms": 49.8978,
+          "total_s": 5.2293,
+          "entries_s": 2349.9,
+          "uploaded_bytes_per_entry": 34851.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "lag_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 2.2377,
+          "p99_ms": 2.6724,
+          "total_s": 0.4787,
+          "entries_s": 25671.5,
+          "uploaded_bytes_per_entry": 1650.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "snapshot16m": {
+          "pending_heap_delta": 16777383.0,
+          "compaction_peak_delta": 33654104.0,
+          "cold_open_ms": 20.0734
+        },
+        "live16m": {
+          "start_ms": 6.9495,
+          "held_heap_delta": 16909181.0,
+          "startup_peak_delta": 16909190.0
+        },
+        "cache_Disabled_entry64": {
+          "p50_ms": 0.0084,
+          "p99_ms": 0.0908,
+          "total_s": 0.0078,
+          "entries_s": 1578109.5
+        },
+        "cache_EveryCommit_entry64": {
+          "p50_ms": 0.0258,
+          "p99_ms": 0.0589,
+          "total_s": 0.0093,
+          "entries_s": 1323816.2
+        },
+        "cache_OnFlush_entry64": {
+          "p50_ms": 0.0038,
+          "p99_ms": 0.009,
+          "total_s": 0.0039,
+          "entries_s": 3130447.0
+        },
+        "cache_Disabled_entry4096": {
+          "p50_ms": 0.2985,
+          "p99_ms": 1.8702,
+          "total_s": 0.0942,
+          "entries_s": 130447.8
+        },
+        "cache_EveryCommit_entry4096": {
+          "p50_ms": 1.044,
+          "p99_ms": 2.528,
+          "total_s": 0.2165,
+          "entries_s": 56768.0
+        },
+        "cache_OnFlush_entry4096": {
+          "p50_ms": 0.3045,
+          "p99_ms": 1.0626,
+          "total_s": 0.0911,
+          "entries_s": 134923.2
+        }
+      },
+      {
+        "fold_install_rtt15": {
+          "commits": 20.0,
+          "entries": 40.0,
+          "p50_ms": 15.2527,
+          "p99_ms": 15.4205,
+          "total_s": 1.2288,
+          "entries_s": 32.6,
+          "uploaded_bytes_per_entry": 183.3,
+          "gets": 0.0,
+          "puts": 60.0,
+          "deletes": 20.0
+        },
+        "steady_batch1_rtt1": {
+          "commits": 192.0,
+          "entries": 192.0,
+          "p50_ms": 1.091,
+          "p99_ms": 1.2163,
+          "total_s": 0.2518,
+          "entries_s": 762.6,
+          "uploaded_bytes_per_entry": 656.6,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch8_rtt1": {
+          "commits": 192.0,
+          "entries": 1536.0,
+          "p50_ms": 1.136,
+          "p99_ms": 1.1929,
+          "total_s": 0.2597,
+          "entries_s": 5915.1,
+          "uploaded_bytes_per_entry": 587.8,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 1.4928,
+          "p99_ms": 1.9812,
+          "total_s": 0.3345,
+          "entries_s": 36735.8,
+          "uploaded_bytes_per_entry": 579.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch256_rtt1": {
+          "commits": 192.0,
+          "entries": 49152.0,
+          "p50_ms": 2.7344,
+          "p99_ms": 4.4006,
+          "total_s": 0.5806,
+          "entries_s": 84661.1,
+          "uploaded_bytes_per_entry": 578.3,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt0": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 0.0291,
+          "p99_ms": 0.0947,
+          "total_s": 0.0107,
+          "entries_s": 1143836.0,
+          "uploaded_bytes_per_entry": 579.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1_entry4096": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 25.8088,
+          "p99_ms": 50.3355,
+          "total_s": 5.2158,
+          "entries_s": 2355.9,
+          "uploaded_bytes_per_entry": 34851.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "lag_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 2.2377,
+          "p99_ms": 2.7407,
+          "total_s": 0.4815,
+          "entries_s": 25519.8,
+          "uploaded_bytes_per_entry": 1650.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "snapshot16m": {
+          "pending_heap_delta": 16777383.0,
+          "compaction_peak_delta": 33654104.0,
+          "cold_open_ms": 15.0637
+        },
+        "live16m": {
+          "start_ms": 4.32,
+          "held_heap_delta": 16909181.0,
+          "startup_peak_delta": 16909190.0
+        },
+        "cache_Disabled_entry64": {
+          "p50_ms": 0.0079,
+          "p99_ms": 0.058,
+          "total_s": 0.0068,
+          "entries_s": 1806536.0
+        },
+        "cache_EveryCommit_entry64": {
+          "p50_ms": 0.0257,
+          "p99_ms": 0.0651,
+          "total_s": 0.0084,
+          "entries_s": 1455131.8
+        },
+        "cache_OnFlush_entry64": {
+          "p50_ms": 0.0042,
+          "p99_ms": 0.0103,
+          "total_s": 0.0031,
+          "entries_s": 3987546.7
+        },
+        "cache_Disabled_entry4096": {
+          "p50_ms": 0.3081,
+          "p99_ms": 1.9998,
+          "total_s": 0.1006,
+          "entries_s": 122197.4
+        },
+        "cache_EveryCommit_entry4096": {
+          "p50_ms": 1.0432,
+          "p99_ms": 2.3501,
+          "total_s": 0.2139,
+          "entries_s": 57447.6
+        },
+        "cache_OnFlush_entry4096": {
+          "p50_ms": 0.3033,
+          "p99_ms": 1.1009,
+          "total_s": 0.0903,
+          "entries_s": 136151.7
+        }
+      },
+      {
+        "fold_install_rtt15": {
+          "commits": 20.0,
+          "entries": 40.0,
+          "p50_ms": 15.2558,
+          "p99_ms": 15.3139,
+          "total_s": 1.2199,
+          "entries_s": 32.8,
+          "uploaded_bytes_per_entry": 183.3,
+          "gets": 0.0,
+          "puts": 60.0,
+          "deletes": 20.0
+        },
+        "steady_batch1_rtt1": {
+          "commits": 192.0,
+          "entries": 192.0,
+          "p50_ms": 1.0937,
+          "p99_ms": 1.2627,
+          "total_s": 0.2552,
+          "entries_s": 752.2,
+          "uploaded_bytes_per_entry": 656.6,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch8_rtt1": {
+          "commits": 192.0,
+          "entries": 1536.0,
+          "p50_ms": 1.1491,
+          "p99_ms": 1.3636,
+          "total_s": 0.2641,
+          "entries_s": 5815.2,
+          "uploaded_bytes_per_entry": 587.8,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 1.4937,
+          "p99_ms": 1.8785,
+          "total_s": 0.3321,
+          "entries_s": 37003.7,
+          "uploaded_bytes_per_entry": 579.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch256_rtt1": {
+          "commits": 192.0,
+          "entries": 49152.0,
+          "p50_ms": 2.736,
+          "p99_ms": 4.3982,
+          "total_s": 0.582,
+          "entries_s": 84446.4,
+          "uploaded_bytes_per_entry": 578.3,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt0": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 0.0293,
+          "p99_ms": 0.0855,
+          "total_s": 0.0107,
+          "entries_s": 1150566.0,
+          "uploaded_bytes_per_entry": 579.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "steady_batch64_rtt1_entry4096": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 26.1379,
+          "p99_ms": 49.713,
+          "total_s": 5.2488,
+          "entries_s": 2341.1,
+          "uploaded_bytes_per_entry": 34851.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "lag_batch64_rtt1": {
+          "commits": 192.0,
+          "entries": 12288.0,
+          "p50_ms": 2.2288,
+          "p99_ms": 2.6255,
+          "total_s": 0.4801,
+          "entries_s": 25593.5,
+          "uploaded_bytes_per_entry": 1650.2,
+          "gets": 0.0,
+          "puts": 216.0,
+          "deletes": 11.0
+        },
+        "snapshot16m": {
+          "pending_heap_delta": 16777383.0,
+          "compaction_peak_delta": 33654104.0,
+          "cold_open_ms": 19.1664
+        },
+        "live16m": {
+          "start_ms": 4.2354,
+          "held_heap_delta": 16909181.0,
+          "startup_peak_delta": 16909190.0
+        },
+        "cache_Disabled_entry64": {
+          "p50_ms": 0.0039,
+          "p99_ms": 0.0236,
+          "total_s": 0.0044,
+          "entries_s": 2775460.8
+        },
+        "cache_EveryCommit_entry64": {
+          "p50_ms": 0.0248,
+          "p99_ms": 0.041,
+          "total_s": 0.0087,
+          "entries_s": 1417371.5
+        },
+        "cache_OnFlush_entry64": {
+          "p50_ms": 0.0041,
+          "p99_ms": 0.0283,
+          "total_s": 0.004,
+          "entries_s": 3052042.7
+        },
+        "cache_Disabled_entry4096": {
+          "p50_ms": 0.2985,
+          "p99_ms": 1.9516,
+          "total_s": 0.096,
+          "entries_s": 127968.8
+        },
+        "cache_EveryCommit_entry4096": {
+          "p50_ms": 1.0407,
+          "p99_ms": 2.382,
+          "total_s": 0.2115,
+          "entries_s": 58085.6
+        },
+        "cache_OnFlush_entry4096": {
+          "p50_ms": 0.3062,
+          "p99_ms": 1.1781,
+          "total_s": 0.0958,
+          "entries_s": 128282.4
+        }
+      }
+    ]
+  },
+  "medians": {
+    "baseline": {
+      "fold_install_rtt15": {
+        "commits": 20.0,
+        "entries": 40.0,
+        "p50_ms": 30.5111,
+        "p99_ms": 31.0133,
+        "total_s": 1.2256,
+        "entries_s": 32.6,
+        "uploaded_bytes_per_entry": 169.5,
+        "gets": 0.0,
+        "puts": 60.0,
+        "deletes": 20.0
+      },
+      "steady_batch1_rtt1": {
+        "commits": 192.0,
+        "entries": 192.0,
+        "p50_ms": 1.0864,
+        "p99_ms": 1.225,
+        "total_s": 0.2504,
+        "entries_s": 766.9,
+        "uploaded_bytes_per_entry": 643.9,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "steady_batch8_rtt1": {
+        "commits": 192.0,
+        "entries": 1536.0,
+        "p50_ms": 1.1305,
+        "p99_ms": 1.2107,
+        "total_s": 0.2573,
+        "entries_s": 5969.9,
+        "uploaded_bytes_per_entry": 586.2,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "steady_batch64_rtt1": {
+        "commits": 192.0,
+        "entries": 12288.0,
+        "p50_ms": 1.487,
+        "p99_ms": 1.8806,
+        "total_s": 0.3308,
+        "entries_s": 37144.4,
+        "uploaded_bytes_per_entry": 579.0,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "steady_batch256_rtt1": {
+        "commits": 192.0,
+        "entries": 49152.0,
+        "p50_ms": 2.7828,
+        "p99_ms": 4.2884,
+        "total_s": 0.5789,
+        "entries_s": 84912.4,
+        "uploaded_bytes_per_entry": 578.3,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "steady_batch64_rtt0": {
+        "commits": 192.0,
+        "entries": 12288.0,
+        "p50_ms": 0.0276,
+        "p99_ms": 0.0895,
+        "total_s": 0.0102,
+        "entries_s": 1209944.0,
+        "uploaded_bytes_per_entry": 579.0,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "steady_batch64_rtt1_entry4096": {
+        "commits": 192.0,
+        "entries": 12288.0,
+        "p50_ms": 26.8821,
+        "p99_ms": 51.3224,
+        "total_s": 5.287,
+        "entries_s": 2324.2,
+        "uploaded_bytes_per_entry": 34851.0,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "lag_batch64_rtt1": {
+        "commits": 192.0,
+        "entries": 12288.0,
+        "p50_ms": 2.234,
+        "p99_ms": 2.6527,
+        "total_s": 0.4782,
+        "entries_s": 25694.5,
+        "uploaded_bytes_per_entry": 1650.0,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "snapshot16m": {
+        "pending_heap_delta": 33554631.0,
+        "compaction_peak_delta": 33653794.0,
+        "cold_open_ms": 14.8493
+      },
+      "live16m": {
+        "start_ms": 3.731,
+        "held_heap_delta": 16909111.0,
+        "startup_peak_delta": 16909135.0
+      }
+    },
+    "candidate": {
+      "fold_install_rtt15": {
+        "commits": 20.0,
+        "entries": 40.0,
+        "p50_ms": 15.2527,
+        "p99_ms": 15.4205,
+        "total_s": 1.225,
+        "entries_s": 32.7,
+        "uploaded_bytes_per_entry": 183.3,
+        "gets": 0.0,
+        "puts": 60.0,
+        "deletes": 20.0
+      },
+      "steady_batch1_rtt1": {
+        "commits": 192.0,
+        "entries": 192.0,
+        "p50_ms": 1.0917,
+        "p99_ms": 1.2627,
+        "total_s": 0.2552,
+        "entries_s": 752.2,
+        "uploaded_bytes_per_entry": 656.6,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "steady_batch8_rtt1": {
+        "commits": 192.0,
+        "entries": 1536.0,
+        "p50_ms": 1.136,
+        "p99_ms": 1.1929,
+        "total_s": 0.2597,
+        "entries_s": 5915.1,
+        "uploaded_bytes_per_entry": 587.8,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "steady_batch64_rtt1": {
+        "commits": 192.0,
+        "entries": 12288.0,
+        "p50_ms": 1.4937,
+        "p99_ms": 1.9052,
+        "total_s": 0.3345,
+        "entries_s": 36735.8,
+        "uploaded_bytes_per_entry": 579.2,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "steady_batch256_rtt1": {
+        "commits": 192.0,
+        "entries": 49152.0,
+        "p50_ms": 2.736,
+        "p99_ms": 4.3982,
+        "total_s": 0.582,
+        "entries_s": 84446.4,
+        "uploaded_bytes_per_entry": 578.3,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "steady_batch64_rtt0": {
+        "commits": 192.0,
+        "entries": 12288.0,
+        "p50_ms": 0.0293,
+        "p99_ms": 0.0947,
+        "total_s": 0.0107,
+        "entries_s": 1143836.0,
+        "uploaded_bytes_per_entry": 579.2,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "steady_batch64_rtt1_entry4096": {
+        "commits": 192.0,
+        "entries": 12288.0,
+        "p50_ms": 25.8088,
+        "p99_ms": 49.8978,
+        "total_s": 5.2293,
+        "entries_s": 2349.9,
+        "uploaded_bytes_per_entry": 34851.2,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "lag_batch64_rtt1": {
+        "commits": 192.0,
+        "entries": 12288.0,
+        "p50_ms": 2.2377,
+        "p99_ms": 2.6724,
+        "total_s": 0.4801,
+        "entries_s": 25593.5,
+        "uploaded_bytes_per_entry": 1650.2,
+        "gets": 0.0,
+        "puts": 216.0,
+        "deletes": 11.0
+      },
+      "snapshot16m": {
+        "pending_heap_delta": 16777383.0,
+        "compaction_peak_delta": 33654104.0,
+        "cold_open_ms": 19.1664
+      },
+      "live16m": {
+        "start_ms": 4.32,
+        "held_heap_delta": 16909181.0,
+        "startup_peak_delta": 16909190.0
+      },
+      "cache_Disabled_entry64": {
+        "p50_ms": 0.0079,
+        "p99_ms": 0.058,
+        "total_s": 0.0068,
+        "entries_s": 1806536.0
+      },
+      "cache_EveryCommit_entry64": {
+        "p50_ms": 0.0257,
+        "p99_ms": 0.0589,
+        "total_s": 0.0087,
+        "entries_s": 1417371.5
+      },
+      "cache_OnFlush_entry64": {
+        "p50_ms": 0.0041,
+        "p99_ms": 0.0103,
+        "total_s": 0.0039,
+        "entries_s": 3130447.0
+      },
+      "cache_Disabled_entry4096": {
+        "p50_ms": 0.2985,
+        "p99_ms": 1.9516,
+        "total_s": 0.096,
+        "entries_s": 127968.8
+      },
+      "cache_EveryCommit_entry4096": {
+        "p50_ms": 1.0432,
+        "p99_ms": 2.382,
+        "total_s": 0.2139,
+        "entries_s": 57447.6
+      },
+      "cache_OnFlush_entry4096": {
+        "p50_ms": 0.3045,
+        "p99_ms": 1.1009,
+        "total_s": 0.0911,
+        "entries_s": 134923.2
+      }
+    }
+  }
+}

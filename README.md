@@ -13,6 +13,7 @@ It's the generalized core of the pattern in [Cursor's "git at any scale"](https:
   - [Compaction](#compaction)
   - [Replicas](#replicas)
   - [The tiers](#the-tiers)
+  - [Cache policies](#cache-policies)
 - [Failure semantics](#failure-semantics)
 - [Application contract](#application-contract)
 - [API migration](#api-migration)
@@ -73,7 +74,7 @@ The image is its own manifest, so bootstrap is one GET. Entries are small metada
 
 Every append failure returns `WriteError { entries, source, outcome }`. `entries` preserves the final attempted batch, including replacements rejected by a resource limit. `source` distinguishes an application abort, exhausted contention budget, invalid input, and storage failure. `outcome` is `NotApplied` unless a WAL PUT may have landed. A failed refresh GET after a rejected CAS is still `NotApplied`, regardless of the backend error's default classification. No callback runs after the final allowed CAS attempt, and uncertain PUTs are never automatically retried.
 
-Commits are serialized by the etag chain at roughly one per store round trip; batching amortizes that request over many entries. `cargo run --release --example group_commit` demonstrates batching.
+Commits are serialized by the etag chain at roughly one per store round trip; batching amortizes that request over many entries. `cargo run --release --example group_commit` demonstrates batching with a bounded queue, maximum entry size, bounded producer receipt windows, and one result per submission after its batch succeeds. Its defaults bound queued payload lengths to 512 KiB plus a 256 KiB writer batch; channel/request overhead, Vec spare capacity, and producer-owned entries/receipts are additional. Dropping all submitters drains accepted work. An append failure is delivered to that batch's producers, stops new admissions, and returns queued entries as `NotApplied`; uncertain batches are not automatically retried. This example adapter uses independent entries with `Retry` reconciliation, so receipt-to-LSN mapping stays one-to-one.
 
 ### Batch reconciliation
 
@@ -92,23 +93,29 @@ This example treats each pending entry as a request for one allocation. Real com
 
 ### Compaction
 
-When `should_compact` fires, a background thread runs `compact` and uploads an immutable snapshot. The fold installs on the writer's **next PUT** or an explicit `flush()`, sharing the append's CAS. Snapshot construction and upload run in the background; starting compaction still copies live entries, and installing a fold currently performs cache and cleanup work before acknowledgement. A fold superseded by a remote compaction is discarded. Replicas never compact.
+When `should_compact` fires, a background thread runs `compact` and uploads an immutable snapshot. The fold installs on the writer's **next PUT** or an explicit `flush()`, sharing the append's CAS. Snapshot construction, upload, and snapshot-cache publication run on the compactor. A prepared fold's installing append makes one WAL CAS and queues obsolete snapshots without issuing remote DELETEs. Starting compaction still copies live entries; the small-metadata workload and measured costs are documented in [PERFORMANCE.md](PERFORMANCE.md). A fold superseded by a remote compaction is discarded. Replicas never compact.
 
 Maintenance results are explicit:
 
 - `compaction_status()` polls without waiting: `Idle`, `Running`, `Ready`, `Installed`, or `Superseded`, or `Err(Compaction(...))`.
 - `wait_for_compaction()` waits for running work and returns its state or failure; `Ready` still needs installation.
-- `flush()` waits for running work and installs any ready fold. An exhausted CAS budget returns `Contention { operation: "flush", .. }` and keeps the fold available for retry.
+- `flush()` waits for running work, installs any ready fold, checkpoints an `OnFlush` cache, and drains tracked cleanup. It returns `MaintenanceStatus { compaction, garbage }`. An exhausted CAS budget returns `Contention { operation: "flush", .. }` and keeps the fold available for retry.
 - A compactor failure or panic stays visible to wait, flush, and close. Automatic triggers do not clear it. Call `compact_now()` to explicitly retry, or `take_compaction_error()` to acknowledge and abandon failed maintenance.
-- `close()` waits and flushes, returning the final status or error. It consumes the handle even on failure. Call `flush(&mut self)` first when you want to retain the handle for retry. Failed maintenance never rolls back acknowledged appends; abandoned snapshots may remain as offline-collectable orphans.
+- `close()` waits and flushes, returning the same maintenance report or error. It consumes the handle even on failure. Call `flush(&mut self)` first when you want to retain the handle for retry. Failed maintenance never rolls back acknowledged appends; abandoned snapshots may remain as offline-collectable orphans.
 
 ```rust
 wal.compact_now();
 let status = wal.wait_for_compaction()?; // Ready, or an explicit failure
 println!("compaction: {status:?}");
-println!("flush: {:?}", wal.flush()?);  // Installed or Superseded when work finished
-wal.close()?;
+let report = wal.flush()?;
+println!("fold: {:?}; cleanup: {:?}", report.compaction, report.garbage);
+let closed = wal.close()?;
+if closed.garbage.overflowed > 0 {
+    // Record this debt for an offline sweep after every writer/upload stops.
+}
 ```
+
+`collect_garbage()` explicitly deletes queued snapshots proven obsolete by WAL transitions. `garbage_status()` reports the queued count, the last DELETE failure, and cumulative `overflowed` candidates. `max_pending_deletes` defaults to 128 identities; a full queue leaves safe orphan objects and records debt for an offline sweep. Duplicate overflow candidates may be counted more than once. This report covers one handle's observations, not a global orphan inventory, and successful close still reports any overflow debt. A failed DELETE remains queued for retry, including an uncertain DELETE result; flushing or closing surfaces that error even if its fold was already installed. Neither append nor refresh waits for remote cleanup, and cleanup failure cannot change an acknowledged append into a failed append.
 
 Plain drop does not wait: a detached compactor may finish uploading a snapshot, but cannot install a WAL reference. Drain compaction before an offline sweep; dropping a handle alone does not prove its upload has stopped. Thread creation failure is recorded as a maintenance error, preserving the success of any append that triggered it.
 
@@ -119,8 +126,14 @@ Plain drop does not wait: a detached compactor may finish uploading a snapshot, 
 ### The tiers
 
 - **Memory** — your `State`, built by applying entries in LSN order
-- **Local disk** — a warm-start cache of the image and snapshot. Records bind the backend namespace and complete object key; the image is also etag-validated on open. Checksums make damaged files read as cache misses. Reusing a cache directory across resources is safe, though competing cache users can evict each other’s files. Old cache formats are automatically ignored.
+- **Local disk** — an optional warm-start cache of the image and snapshot. Records bind the backend namespace and complete object key; the image is also etag-validated on open. Checksums make damaged files read as cache misses. Reusing a cache directory across resources is safe, though competing cache users can evict each other’s files. Old cache formats are automatically ignored.
 - **S3** — the durable copy and the arbiter of truth
+
+### Cache policies
+
+`Options::default()` disables filesystem caching. `Options::new(path)` enables `CachePolicy::EveryCommit`, which saves each observed WAL version. Set `options.cache_policy = CachePolicy::OnFlush` to checkpoint the WAL only on explicit `flush`, `close`, or `checkpoint_cache()`. Replicas can call `checkpoint_cache()` directly. Snapshot fetches and confirmed uploads populate the snapshot cache under either enabled policy; snapshot publication finishes on the compactor before it reports `Ready`.
+
+Cache setup and writes are best effort: an unavailable directory does not prevent opening or writing the log. Disabled caches and stores without a known `cache_namespace()` perform no cache filesystem operations. A stale checkpoint is always ETag-validated against the authoritative store, and cache loss never changes acknowledged history. Cache files remain compatible with `WTC2`; streaming writes avoid concatenating whole image/snapshot bodies for framing and checksumming. Policy comparisons and their complete checkpoint costs are in [PERFORMANCE.md](PERFORMANCE.md).
 
 ## Failure semantics
 
@@ -128,7 +141,7 @@ Plain drop does not wait: a detached compactor may finish uploading a snapshot, 
 - `WriteError.outcome == MutationOutcome::Unknown` can hide a PUT that landed, such as a timeout after S3 applied it. The error retains the candidate entries; WalTier returns without locally applying or retrying that candidate. Refresh, then inspect application request IDs before deciding whether to resubmit. Refresh can discover the uncertain entries. Caller resubmission can append duplicates, so use stable request IDs or idempotent commands; this is not exactly-once delivery.
 - Snapshots use random 128-bit IDs and create-only PUTs. A key collision is retried without overwriting the existing object. Failed uploads can leave possible orphan objects; the compaction error names the candidate key. An ambiguous WAL installation never authorizes deleting its candidate snapshot.
 - Orphan sweeping is supported **only offline**: stop new writes, drain or terminate every writer and compaction/publication request, and discard all old handles so no pending fold can later install. After that, reread the authoritative WAL, keep its referenced snapshot, delete other objects under that WAL’s `snap/` prefix, and reopen writers. A pending upload or fold is not garbage merely because the current WAL does not reference it. Rereading the WAL during an online sweep, or adding a minimum object age, does not make that sweep safe. Do not use age-based expiration: it can delete the live snapshot of an idle log.
-- Normal compaction may delete a snapshot proven superseded by an accepted WAL transition. A reader racing that deletion rereads the WAL and reconstructs from its newer snapshot. Repeated changing references exhaust a `Contention` budget; two authoritative reads of the same version referencing a missing snapshot return `Corrupt`. Local cache cleanup only removes disposable files.
+- Explicit cleanup may delete a snapshot proven superseded by an accepted WAL transition. A reader racing that deletion rereads the WAL and reconstructs from its newer snapshot. Repeated changing references exhaust a `Contention` budget; two authoritative reads of the same version referencing a missing snapshot return `Corrupt`. Local cache cleanup only removes disposable files.
 
 ## Application contract
 
@@ -140,7 +153,7 @@ Callbacks must return without panicking. A foreground callback panic can happen 
 
 This is a breaking API update from 0.2, intended for 0.3. The `WTL1` object format is unchanged. Update append error handling from `WalError::Conflict { entries }` to `WriteError { entries, source, outcome }`; application rejection is `WalError::ReconcileAborted`, while retry exhaustion is `WalError::Contention`. Inspect `outcome` before resubmitting, and keep `entries` when propagating failures. Whole-batch overrides use `ReconcileBatch`; existing independent-entry `reconcile` implementations continue to work through its default adapter.
 
-Replace boolean `wait_for_compaction()` checks with its `Result<CompactionStatus, WalError>`. `flush` and `close` also return a status, wait for running work, and surface failures. Handle a failed compactor explicitly instead of relying on automatic retry. See the object-store section for `StoreError` and filesystem-root migration.
+Replace boolean `wait_for_compaction()` checks with its `Result<CompactionStatus, WalError>`. `flush` and `close` return `MaintenanceStatus { compaction, garbage }`, wait for running work, and surface compaction or cleanup failures. Inspect the garbage report for offline-sweep debt. Handle a failed compactor explicitly instead of relying on automatic retry. See the object-store section for `StoreError` and filesystem-root migration.
 
 ## Resource limits
 
@@ -158,7 +171,7 @@ Every candidate image is checked before CAS. Exceeding an image/count budget rej
 - `MemoryStore` — an isolated in-memory resource for tests.
 - `FsStore` — a development backend with one atomic file per object (validator plus data), nonaliasing object paths, and an OS lock held for the store’s lifetime. Share an `Arc<FsStore>`; a second independent open of the root is rejected, including from another process. It requires Rust 1.89 or later for standard-library file locking. It does not fsync files or directories and does not promise power-loss durability. Existing directories using the old data-plus-`.etag` layout are rejected: use a fresh root or export/reimport data with the old version before upgrading. The authoritative `WTL1` object format is unchanged.
 
-Custom stores must implement atomic conditional replacement, coherent data/validator reads, and strong read-after-write behavior. Validators identify an object version, not a whole backend; identical content may repeat an ETag. Reserve WalTier’s WAL and snapshot keys from application mutations. Implement `cache_namespace()` with a stable identity for the backing resource to enable persistent caching, and forward it through wrappers. Its default `None` safely bypasses cached data; cache directory setup and stale-file cleanup may still occur. Built-in stores provide namespaces; S3 scopes them to endpoint, bucket, access-key identity, region, and addressing mode.
+Custom stores must implement atomic conditional replacement, coherent data/validator reads, and strong read-after-write behavior. Validators identify an object version, not a whole backend; identical content may repeat an ETag. Reserve WalTier’s WAL and snapshot keys from application mutations. Implement `cache_namespace()` with a stable identity for the backing resource to enable persistent caching, and forward it through wrappers. Its default `None` bypasses all cache filesystem operations. Built-in stores provide namespaces; S3 scopes them to endpoint, bucket, access-key identity, region, and addressing mode.
 
 `S3Options` defaults to a 10-second connection timeout, a 60-second request deadline, and a 1 GiB maximum body for **both GET and PUT** (including application payload objects). `connect_timeout` is capped to `request_timeout`; request deadlines must be positive and below the 300-second signing TTL. The request deadline covers response headers, response bodies, and upload progress. The upload checks elapsed time between 8 KiB chunks. DNS resolution and an already executing transport/TLS call cannot be forcibly cancelled and may overrun the nominal deadline; this blocking API does not promise hard cancellation. Custom stores must implement their own time and allocation bounds, and user callbacks must return; WalTier cannot interrupt them. Transport tests use a local HTTP server, with no real S3 credentials or service access.
 
@@ -178,7 +191,9 @@ The `waltier::sim` module (feature `sim`, on by default) provides the seeded RNG
 cargo bench --bench wal -- --rtt-ms 15 --mbps 100 --writes 200
 ```
 
-It reports write latency percentiles and throughput, per-write cost growth without compaction, cold vs warm open, and replica poll cost. Commit latency is RTT-bound; with no store latency the library sustains ~70k writes/s on one thread.
+It reports write latency percentiles and throughput, per-write cost growth without compaction, cold versus warm open, and replica polling cost. The review benchmarks cover sustained folds, batch sizes, cache policies, larger images, and snapshot/compaction memory. See [PERFORMANCE.md](PERFORMANCE.md) for reproducible inputs, repeated measurements, and the supported workload envelope. Results from simulated latency are not measurements of a real S3 service.
+
+In the three-run comparison against the previous `main`, replacement-fold acknowledgement p99 fell from 31.01 to 15.42 ms at 15 ms simulated RTT; total maintenance cost stayed essentially unchanged. A prepared 16 MiB snapshot retained about 16 MiB less heap. The report includes cache-policy results and slower cold-open measurements as well as these improvements.
 
 ## What WalTier doesn't do
 

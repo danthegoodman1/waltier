@@ -64,8 +64,8 @@ pub trait ObjectStore: Send + Sync {
     /// Different backends/resources must never share a namespace even when
     /// their ETags coincide. Return the same value across handles/restarts
     /// only when they address the same storage. Wrappers should forward it.
-    /// The default bypasses cached data. Cache directory setup and stale-file
-    /// cleanup may still occur.
+    /// The default bypasses all cache filesystem operations, including directory
+    /// setup and stale-file cleanup.
     fn cache_namespace(&self) -> Option<String> {
         None
     }

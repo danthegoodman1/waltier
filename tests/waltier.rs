@@ -778,6 +778,9 @@ fn ambiguous_fold_install_collects_the_previous_snapshot() {
 
     assert!(!w.has_pending_fold());
     assert_eq!(w.stats().snapshot_lsn, Some(1), "the install landed");
+    assert_eq!(w.garbage_status().pending, 1);
+    assert_eq!(snap_keys(&inner).len(), 2, "refresh defers remote deletion");
+    w.collect_garbage().unwrap();
     assert_eq!(snap_keys(&inner).len(), 1, "the replaced snapshot is gone");
     assert_eq!(cached_snapshots(dir.path()).len(), 1);
     let (w2, _d2) = writer(&inner, Kv::new());
