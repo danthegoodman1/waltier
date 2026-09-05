@@ -31,6 +31,7 @@ pub struct S3Store {
     bucket: Bucket,
     creds: Credentials,
     agent: ureq::Agent,
+    namespace: String,
 }
 
 impl S3Store {
@@ -44,12 +45,24 @@ impl S3Store {
         } else {
             UrlStyle::VirtualHost
         };
+        let namespace = format!(
+            "s3:{}:{}:{}:{}:{}:{}:{}:{}",
+            endpoint.as_str().len(),
+            endpoint,
+            cfg.bucket.len(),
+            cfg.bucket,
+            cfg.access_key.len(),
+            cfg.access_key,
+            cfg.region,
+            cfg.path_style
+        );
         let bucket = Bucket::new(endpoint, style, cfg.bucket, cfg.region)
             .map_err(|e| StoreError(format!("bad bucket config: {e}")))?;
         let creds = Credentials::new(cfg.access_key, cfg.secret_key);
         Ok(Self {
             bucket,
             creds,
+            namespace,
             agent: ureq::AgentBuilder::new().build(),
         })
     }
@@ -78,6 +91,10 @@ fn read_body(key: &str, resp: ureq::Response) -> Result<Vec<u8>, StoreError> {
 }
 
 impl ObjectStore for S3Store {
+    fn cache_namespace(&self) -> Option<String> {
+        Some(self.namespace.clone())
+    }
+
     fn get(&self, key: &str) -> Result<Option<Stored>, StoreError> {
         match self.get_if_changed(key, None)? {
             CondGet::Changed(s) => Ok(Some(s)),

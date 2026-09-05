@@ -6,26 +6,60 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Cache-file framing: magic, checksum, payload length, payload.
-const MAGIC: &[u8; 4] = b"WTC1";
+const MAGIC: &[u8; 4] = b"WTC2";
 const HEADER: usize = 4 + 8 + 8;
 
-/// Flatten an object key into a single filename component.
-pub(crate) fn escape_key(key: &str) -> String {
-    key.replace('/', "__")
+/// An injective encoding for identity fields and filename components.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    out
 }
 
-/// Write `parts` to `path` via a temp file and rename, so readers never see
-/// a torn file.
+/// Atomically publish through an exclusively created sibling temporary file.
+/// The file is disposable: this does not promise power-loss durability.
 pub(crate) fn write_atomic(path: &Path, parts: &[&[u8]]) -> io::Result<()> {
-    let tmp = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
-    let mut file = fs::File::create(&tmp)?;
-    for part in parts {
-        file.write_all(part)?;
+    write_atomic_with(path, |file| {
+        for part in parts {
+            file.write_all(part)?;
+        }
+        Ok(())
+    })
+}
+
+fn write_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let (tmp, mut file) = loop {
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".waltier-{}-{seq}.tmp", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = write(&mut file).and_then(|()| {
+        drop(file);
+        fs::rename(&tmp, path)
+    });
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
     }
-    drop(file);
-    fs::rename(&tmp, path)
+    result
 }
 
 /// Catches torn, truncated, and mangled cache files. Not cryptographic.
@@ -70,13 +104,16 @@ fn write_checked(path: &Path, payload: &[u8]) {
 #[derive(Clone)]
 pub(crate) struct Cache {
     dir: PathBuf,
+    identity: Option<Vec<u8>>,
 }
 
 impl Cache {
-    pub fn new(dir: &Path) -> io::Result<Self> {
+    pub fn new(dir: &Path, namespace: Option<&str>, wal_key: &str) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
+            identity: namespace
+                .map(|ns| format!("{}:{ns}{}:{wal_key}", ns.len(), wal_key.len()).into_bytes()),
         })
     }
 
@@ -85,12 +122,15 @@ impl Cache {
     }
 
     fn snap_path(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("snap-{}", escape_key(key)))
+        // Filenames are only lookup hints; full identity is checked in the record.
+        // A bounded name handles arbitrarily long object keys without ENAMETOOLONG.
+        self.dir
+            .join(format!("snap-{:016x}", checksum(key.as_bytes())))
     }
 
     /// The cached WAL image and the etag it was fetched under.
     pub fn load_wal(&self) -> Option<(String, Vec<u8>)> {
-        let data = read_checked(&self.wal_path())?;
+        let data = self.load(&self.wal_path(), b"wal")?;
         let n = u16::from_le_bytes([*data.first()?, *data.get(1)?]) as usize;
         let etag = String::from_utf8(data.get(2..2 + n)?.to_vec()).ok()?;
         Some((etag, data[2 + n..].to_vec()))
@@ -104,15 +144,38 @@ impl Cache {
         payload.extend_from_slice(&(etag.len() as u16).to_le_bytes());
         payload.extend_from_slice(etag.as_bytes());
         payload.extend_from_slice(image);
-        write_checked(&self.wal_path(), &payload);
+        self.save(&self.wal_path(), b"wal", &payload);
     }
 
     pub fn load_snapshot(&self, key: &str) -> Option<Vec<u8>> {
-        read_checked(&self.snap_path(key))
+        self.load(&self.snap_path(key), key.as_bytes())
     }
 
     pub fn save_snapshot(&self, key: &str, data: &[u8]) {
-        write_checked(&self.snap_path(key), data);
+        self.save(&self.snap_path(key), key.as_bytes(), data);
+    }
+
+    fn load(&self, path: &Path, key: &[u8]) -> Option<Vec<u8>> {
+        let identity = self.identity.as_ref()?;
+        let data = read_checked(path)?;
+        let rest = data.strip_prefix(identity.as_slice())?;
+        let key_len = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+        if key_len != key.len() as u64 {
+            return None;
+        }
+        Some(rest.get(8..)?.strip_prefix(key)?.to_vec())
+    }
+
+    fn save(&self, path: &Path, key: &[u8], data: &[u8]) {
+        let Some(identity) = &self.identity else {
+            return;
+        };
+        let mut payload = Vec::with_capacity(identity.len() + 8 + key.len() + data.len());
+        payload.extend_from_slice(identity);
+        payload.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        payload.extend_from_slice(key);
+        payload.extend_from_slice(data);
+        write_checked(path, &payload);
     }
 
     pub fn remove_snapshot(&self, key: &str) {
@@ -145,7 +208,7 @@ mod tests {
 
     fn cache() -> (Cache, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        (Cache::new(dir.path()).unwrap(), dir)
+        (Cache::new(dir.path(), Some("test"), "wal").unwrap(), dir)
     }
 
     #[test]
@@ -169,17 +232,16 @@ mod tests {
     /// bytes the caller would trust.
     #[test]
     fn damaged_files_read_as_misses() {
-        let (c, dir) = cache();
+        let (c, _dir) = cache();
         c.save_wal("\"etag-1\"", b"image bytes");
         c.save_snapshot("snap/k", b"snapshot bytes");
         type Load<'a> = &'a dyn Fn() -> Option<Vec<u8>>;
-        let load: [(&str, Load); 2] = [
-            ("wal.cache", &|| c.load_wal().map(|(_, image)| image)),
-            ("snap-snap__k", &|| c.load_snapshot("snap/k")),
+        let load: [(PathBuf, Load); 2] = [
+            (c.wal_path(), &|| c.load_wal().map(|(_, image)| image)),
+            (c.snap_path("snap/k"), &|| c.load_snapshot("snap/k")),
         ];
 
-        for (name, load) in load {
-            let path = dir.path().join(name);
+        for (path, load) in load {
             let good = fs::read(&path).unwrap();
             let damaged = [
                 good[..good.len() - 1].to_vec(), // truncated tail
@@ -205,10 +267,10 @@ mod tests {
             ];
             for bytes in damaged {
                 fs::write(&path, &bytes).unwrap();
-                assert_eq!(load(), None, "{name} from {} bytes", bytes.len());
+                assert_eq!(load(), None, "{path:?} from {} bytes", bytes.len());
             }
             fs::write(&path, &good).unwrap();
-            assert!(load().is_some(), "{name} must survive being restored");
+            assert!(load().is_some(), "{path:?} must survive being restored");
         }
         assert!(c.load_wal().is_some());
         assert!(c.load_snapshot("snap/k").is_some());
@@ -230,6 +292,73 @@ mod tests {
         c.retain_snapshot(None);
         assert_eq!(c.load_snapshot("snap/b"), None);
         assert!(c.load_wal().is_some());
+    }
+
+    #[test]
+    fn cache_identity_covers_backend_wal_key_and_snapshot_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Cache::new(dir.path(), Some("backend-a"), "a/wal").unwrap();
+        a.save_wal("same-etag", b"history-a");
+        a.save_snapshot("snap/same", b"snapshot-a");
+        for (namespace, wal_key) in [
+            (Some("backend-b"), "a/wal"),
+            (Some("backend-a"), "b/wal"),
+            (None, "a/wal"),
+        ] {
+            let b = Cache::new(dir.path(), namespace, wal_key).unwrap();
+            assert_eq!(b.load_wal(), None);
+            assert_eq!(b.load_snapshot("snap/same"), None);
+        }
+        // Even a deliberately misplaced, checksum-valid record must miss.
+        fs::copy(a.snap_path("snap/same"), a.snap_path("snap/different")).unwrap();
+        assert_eq!(a.load_snapshot("snap/different"), None);
+        let unknown = Cache::new(dir.path(), None, "a/wal").unwrap();
+        unknown.save_wal("same-etag", b"wrong");
+        assert_eq!(a.load_wal().unwrap().1, b"history-a");
+    }
+
+    #[test]
+    fn shared_cache_writers_never_publish_a_partial_or_foreign_record() {
+        let dir = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let dir = dir.path();
+                scope.spawn(move || {
+                    let key = format!("{n}/wal");
+                    let c = Cache::new(dir, Some("backend"), &key).unwrap();
+                    let payload = vec![n as u8; 8192];
+                    for _ in 0..32 {
+                        c.save_wal("same-etag", &payload);
+                        c.save_snapshot("same-snapshot-key", &payload);
+                        if let Some((_, bytes)) = c.load_wal() {
+                            assert_eq!(bytes, payload);
+                        }
+                        if let Some(bytes) = c.load_snapshot("same-snapshot-key") {
+                            assert_eq!(bytes, payload);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .all(|e| { !e.unwrap().file_name().to_string_lossy().ends_with(".tmp") })
+        );
+    }
+
+    #[test]
+    fn failed_atomic_preparation_preserves_the_published_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object");
+        write_atomic(&path, &[b"old-etag", b"old-data"]).unwrap();
+        let error = write_atomic_with(&path, |file| {
+            file.write_all(b"new-etag-partial-data")?;
+            Err(io::Error::other("injected disk-full during preparation"))
+        });
+        assert!(error.is_err());
+        assert_eq!(fs::read(path).unwrap(), b"old-etagold-data");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

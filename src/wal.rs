@@ -1,13 +1,12 @@
 //! The writer ([`WalTier`]) and read-only follower ([`Replica`]).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use crate::cache::Cache;
 use crate::image::{SnapshotRef, WalImage};
-use crate::store::{CondGet, CondPut, ObjectStore, Stored, nanos_since_epoch};
+use crate::store::{CondGet, CondPut, ObjectStore, Stored, unique_id};
 use crate::{Entry, Lsn, Reconcile, WalApp, WalError, WalStats};
 
 /// Bound on re-reading the WAL when a concurrent compaction keeps replacing
@@ -35,18 +34,6 @@ impl Options {
 
     fn wal_key(&self) -> String {
         format!("{}wal", self.prefix)
-    }
-
-    fn snap_key(&self, lsn: Lsn) -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let count = COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!(
-            "{}snap/{:020}-{:x}-{:x}",
-            self.prefix,
-            lsn,
-            nanos_since_epoch(),
-            count
-        )
     }
 }
 
@@ -125,8 +112,12 @@ impl<A: WalApp> Core<A> {
         opts: Options,
         create_if_missing: bool,
     ) -> Result<Self, WalError> {
-        let cache = Cache::new(&opts.cache_dir)?;
         let wal_key = opts.wal_key();
+        let cache = Cache::new(
+            &opts.cache_dir,
+            store.cache_namespace().as_deref(),
+            &wal_key,
+        )?;
         // A cached image that no longer decodes is not offered as a cache
         // entry at all, so the store copy is fetched instead.
         let cached = cache
@@ -622,11 +613,17 @@ impl<A: WalApp> WalTier<A> {
             .image
             .tip()
             .expect("caller checked entries are nonempty");
-        let snap_key = self.core.opts.snap_key(fold_lsn);
+        let snap_prefix = format!("{}snap/{fold_lsn:020}-", self.core.opts.prefix);
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
             let _ = tx.send(run_compaction(
-                app, store, cache, base_key, entries, fold_lsn, snap_key,
+                app,
+                store,
+                cache,
+                base_key,
+                entries,
+                fold_lsn,
+                snap_prefix,
             ));
         });
         self.compaction = Some(CompactionTask { rx, handle });
@@ -640,7 +637,7 @@ fn run_compaction<A: WalApp>(
     base_key: Option<String>,
     entries: Vec<Entry>,
     fold_lsn: Lsn,
-    snap_key: String,
+    snap_prefix: String,
 ) -> CompactOutcome {
     let base = match &base_key {
         None => None,
@@ -658,14 +655,41 @@ fn run_compaction<A: WalApp>(
         Ok(s) => s,
         Err(e) => return CompactOutcome::Failed(e.to_string()),
     };
-    match store.put(&snap_key, &snapshot) {
-        Ok(_) => CompactOutcome::Done(Fold {
-            key: snap_key,
+    match publish_snapshot(store.as_ref(), &snapshot, || {
+        unique_id().map(|id| format!("{snap_prefix}{id}"))
+    }) {
+        Ok(key) => CompactOutcome::Done(Fold {
+            key,
             lsn: fold_lsn,
             bytes: Arc::new(snapshot),
         }),
         Err(e) => CompactOutcome::Failed(e.to_string()),
     }
+}
+
+/// A collision never grants ownership of the existing object. A failed PUT
+/// may have landed, so preserve that candidate and name it in the error for
+/// offline collection; neither installing it nor deleting it is safe to infer.
+fn publish_snapshot(
+    store: &dyn ObjectStore,
+    snapshot: &[u8],
+    mut next_key: impl FnMut() -> std::io::Result<String>,
+) -> Result<String, crate::StoreError> {
+    for _ in 0..MAX_RACES {
+        let key = next_key().map_err(|e| crate::StoreError(format!("snapshot ID: {e}")))?;
+        match store.put_if_match(&key, None, snapshot) {
+            Ok(CondPut::Ok { .. }) => return Ok(key),
+            Ok(CondPut::PreconditionFailed) => continue,
+            Err(e) => {
+                return Err(crate::StoreError(format!(
+                    "snapshot upload {key} failed (possible orphan retained): {e}"
+                )));
+            }
+        }
+    }
+    Err(crate::StoreError(
+        "snapshot key collision budget exhausted".into(),
+    ))
 }
 
 /// A read-only follower. Polls the WAL with conditional GETs; never writes
@@ -704,5 +728,33 @@ impl<A: WalApp> Replica<A> {
     /// The underlying store, for app payload objects that live outside the WAL.
     pub fn store(&self) -> Arc<dyn ObjectStore> {
         self.core.store.clone()
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use crate::MemoryStore;
+
+    #[test]
+    fn snapshot_collision_retries_without_overwriting_the_existing_object() {
+        let store = MemoryStore::new();
+        store
+            .put("snap/collision", b"acknowledged-history")
+            .unwrap();
+        let mut keys = ["snap/collision", "snap/new"].into_iter();
+        let key =
+            publish_snapshot(&store, b"candidate", || Ok(keys.next().unwrap().into())).unwrap();
+        assert_eq!(key, "snap/new");
+        assert_eq!(
+            store.get("snap/collision").unwrap().unwrap().data,
+            b"acknowledged-history"
+        );
+        assert_eq!(store.get(&key).unwrap().unwrap().data, b"candidate");
+        assert!(publish_snapshot(&store, b"replacement", || Ok("snap/collision".into())).is_err());
+        assert_eq!(
+            store.get("snap/collision").unwrap().unwrap().data,
+            b"acknowledged-history"
+        );
     }
 }

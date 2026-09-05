@@ -205,6 +205,10 @@ impl SimStore {
 }
 
 impl ObjectStore for SimStore {
+    fn cache_namespace(&self) -> Option<String> {
+        self.inner.cache_namespace()
+    }
+
     fn get(&self, key: &str) -> Result<Option<Stored>, StoreError> {
         self.roll_clean_fault("get", key)?;
         let found = self.inner.get(key)?;

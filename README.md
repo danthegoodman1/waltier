@@ -52,7 +52,7 @@ The whole log is **one small S3 object** (the WAL image), rewritten wholesale on
 
 ```
 {prefix}wal            snapshot pointer + live entries (CAS'd on every write)
-{prefix}snap/<lsn>-<n> immutable snapshots written by compaction
+{prefix}snap/<lsn>-<id> immutable snapshots published with create-only PUT
 ```
 
 The image is its own manifest, so bootstrap is one GET. Entries are small metadata — every write re-uploads the whole image, so you write large payloads as separate immutable objects first (through the same `ObjectStore`), then append an entry that references them.
@@ -78,21 +78,26 @@ Compaction is insert-triggered and never blocks writes. When `should_compact` fi
 ### The tiers
 
 - **Memory** — your `State`, built by applying entries in LSN order
-- **Local disk** — a warm-start cache of the image and snapshot. The image is etag-validated on open, and every cache file carries a checksum, so a damaged one reads back as a miss and costs one extra download
+- **Local disk** — a warm-start cache of the image and snapshot. Records bind the backend namespace and complete object key; the image is also etag-validated on open. Checksums make damaged files read as cache misses. Reusing a cache directory across resources is safe, though competing cache users can evict each other’s files. Old cache formats are automatically ignored.
 - **S3** — the durable copy and the arbiter of truth
 
 ## Failure semantics
 
 - A stale writer corrupts nothing — it loses CASes until it catches up.
 - An error can hide a PUT that landed (a timeout after S3 applied it). WalTier never applies unacked entries locally; the next refresh picks them up. A caller that resubmits appends a duplicate, so writes are **at-least-once** — make entries idempotent or catch duplicates in `reconcile`.
-- A crash between uploading a snapshot and installing it orphans one object. Sweep `snap/` against the key the current WAL image names — everything else under the prefix is garbage. An age-based lifecycle rule would delete the live snapshot on an idle log, so don't use one.
+- Snapshots use random 128-bit IDs and create-only PUTs. A key collision is retried without overwriting the existing object. Failed uploads can leave possible orphan objects; the compaction error names the candidate key. An ambiguous WAL installation never authorizes deleting its candidate snapshot.
+- Orphan sweeping is supported **only offline**: stop new writes, drain or terminate every writer and compaction/publication request, and discard all old handles so no pending fold can later install. After that, reread the authoritative WAL, keep its referenced snapshot, delete other objects under that WAL’s `snap/` prefix, and reopen writers. A pending upload or fold is not garbage merely because the current WAL does not reference it. Rereading the WAL during an online sweep, or adding a minimum object age, does not make that sweep safe. Do not use age-based expiration: it can delete the live snapshot of an idle log.
+- Normal compaction may delete a snapshot proven superseded by an accepted WAL transition. A reader racing that deletion rereads the WAL and reconstructs from its newer snapshot. Local cache cleanup only removes disposable files.
 
 ## Object stores
 
 `ObjectStore` is the seam: conditional get, CAS put (`If-Match` / `If-None-Match: *`), plain put, delete.
 
 - `S3Store` (default feature `s3`) — sync HTTP via `rusty-s3` + `ureq`. Needs S3 conditional writes, which general-purpose buckets support in all regions.
-- `MemoryStore` and `FsStore` — for tests and single-process development.
+- `MemoryStore` — an isolated in-memory resource for tests.
+- `FsStore` — a development backend with one atomic file per object (validator plus data), nonaliasing object paths, and an OS lock held for the store’s lifetime. Share an `Arc<FsStore>`; a second independent open of the root is rejected, including from another process. It requires Rust 1.89 or later for standard-library file locking. It does not fsync files or directories and does not promise power-loss durability. Existing directories using the old data-plus-`.etag` layout are rejected: use a fresh root or export/reimport data with the old version before upgrading. The authoritative `WTL1` object format is unchanged.
+
+Custom stores must implement atomic conditional replacement, coherent data/validator reads, and strong read-after-write behavior. Validators identify an object version, not a whole backend; identical content may repeat an ETag. Reserve WalTier’s WAL and snapshot keys from application mutations. Implement `cache_namespace()` with a stable identity for the backing resource to enable persistent caching, and forward it through wrappers. Its default `None` safely bypasses cached data; cache directory setup and stale-file cleanup may still occur. Built-in stores provide namespaces; S3 scopes them to endpoint, bucket, access-key identity, region, and addressing mode.
 
 ## Testing
 

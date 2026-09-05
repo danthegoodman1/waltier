@@ -18,6 +18,7 @@ s3 = ["dep:rusty-s3", "dep:ureq", "dep:url"]
 sim = []
 
 [dependencies]
+getrandom = "0.4"
 thiserror = "2"
 rusty-s3 = { version = "0.5", optional = true }
 ureq = { version = "2", optional = true }
