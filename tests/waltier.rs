@@ -180,7 +180,12 @@ fn conflict_abort_hands_back_entry() {
     assert_eq!(a.write(b"set a 1".to_vec()).unwrap(), 0);
 
     let err = b.write(b"set b 2".to_vec()).unwrap_err();
-    let WalError::Conflict { entries } = err else {
+    let waltier::WriteError {
+        entries,
+        source: WalError::ReconcileAborted,
+        ..
+    } = err
+    else {
         panic!("expected Conflict, got {err}")
     };
     assert_eq!(entries, vec![b"set b 2".to_vec()]);
@@ -227,7 +232,11 @@ fn insert_triggered_compaction_installs_on_next_write() {
     w.write(b"set a 3".to_vec()).unwrap();
 
     assert!(w.compaction_running() || w.has_pending_fold());
-    assert!(w.wait_for_compaction(), "{:?}", w.last_compaction_error());
+    assert!(
+        w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready,
+        "{:?}",
+        w.last_compaction_error()
+    );
 
     // The fold rides on the next PUT.
     assert_eq!(w.write(b"set c 4".to_vec()).unwrap(), 3);
@@ -251,7 +260,11 @@ fn flush_installs_fold_on_idle_log() {
     w.write(b"set b 2".to_vec()).unwrap();
 
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction(), "{:?}", w.last_compaction_error());
+    assert!(
+        w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready,
+        "{:?}",
+        w.last_compaction_error()
+    );
     w.flush().unwrap();
 
     let stats = w.stats();
@@ -271,7 +284,11 @@ fn repeated_folds_leave_one_snapshot() {
     for round in 0..3 {
         w.write(format!("set k{round} v").into_bytes()).unwrap();
         assert!(w.compact_now());
-        assert!(w.wait_for_compaction(), "{:?}", w.last_compaction_error());
+        assert!(
+            w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready,
+            "{:?}",
+            w.last_compaction_error()
+        );
         w.flush().unwrap();
         assert_eq!(snap_keys(&store).len(), 1, "old snapshots must be deleted");
     }
@@ -291,7 +308,11 @@ fn replica_follows_and_restores_across_folds() {
     w.write(b"set b 2".to_vec()).unwrap();
     w.write(b"set a 3".to_vec()).unwrap();
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction(), "{:?}", w.last_compaction_error());
+    assert!(
+        w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready,
+        "{:?}",
+        w.last_compaction_error()
+    );
     w.flush().unwrap();
     w.write(b"set c 4".to_vec()).unwrap();
 
@@ -327,9 +348,9 @@ fn competing_folds_one_wins_loser_cleans_up() {
     assert_eq!(b.tip(), Some(1));
 
     assert!(a.compact_now());
-    assert!(a.wait_for_compaction());
+    assert!(a.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     assert!(b.compact_now());
-    assert!(b.wait_for_compaction());
+    assert!(b.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     assert_eq!(snap_keys(&store).len(), 2, "both snapshot objects uploaded");
 
     a.flush().unwrap();
@@ -346,7 +367,11 @@ fn competing_folds_one_wins_loser_cleans_up() {
     // base even though B never held its bytes.
     assert_eq!(b.write(b"set c 3".to_vec()).unwrap(), 2);
     assert!(b.compact_now());
-    assert!(b.wait_for_compaction(), "{:?}", b.last_compaction_error());
+    assert!(
+        b.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready,
+        "{:?}",
+        b.last_compaction_error()
+    );
     b.flush().unwrap();
     assert_eq!(b.stats().snapshot_lsn, Some(2));
     assert_eq!(snap_keys(&store).len(), 1);
@@ -365,7 +390,7 @@ fn warm_start_uses_local_cache() {
     w.write(b"set a 1".to_vec()).unwrap();
     w.write(b"set b 2".to_vec()).unwrap();
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction());
+    assert!(w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     w.flush().unwrap();
     let expected = w.state().clone();
     drop(w);
@@ -409,7 +434,7 @@ fn prefix_scopes_all_objects() {
     let mut w = WalTier::open(s, Kv::new(), opts).unwrap();
     w.write(b"set a 1".to_vec()).unwrap();
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction());
+    assert!(w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     w.flush().unwrap();
     assert!(store.keys().iter().all(|k| k.starts_with("logs/orders/")));
 }
@@ -460,7 +485,7 @@ fn ambiguous_fold_install_adopts_own_snapshot() {
     w.write(b"set a 1".to_vec()).unwrap();
     w.write(b"set b 2".to_vec()).unwrap();
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction());
+    assert!(w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
 
     store.fail_next_mutation_ambiguously("wal");
     w.flush().unwrap_err();
@@ -482,7 +507,11 @@ fn ambiguous_fold_install_adopts_own_snapshot() {
     // bootstrap can restore from it.
     w.write(b"set c 3".to_vec()).unwrap();
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction(), "{:?}", w.last_compaction_error());
+    assert!(
+        w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready,
+        "{:?}",
+        w.last_compaction_error()
+    );
     w.flush().unwrap();
     assert_eq!(w.stats().snapshot_lsn, Some(2));
     let (w2, _d2) = writer(&inner, Kv::new());
@@ -545,7 +574,12 @@ fn write_retries_are_bounded_by_max_write_attempts() {
 
     store.conflict.store(true, Ordering::SeqCst);
     let err = w.write(b"set b 2".to_vec()).unwrap_err();
-    let WalError::Conflict { entries } = err else {
+    let waltier::WriteError {
+        entries,
+        source: WalError::Contention { .. },
+        ..
+    } = err
+    else {
         panic!("expected Conflict, got {err}")
     };
     assert_eq!(entries, vec![b"set b 2".to_vec()]);
@@ -619,7 +653,7 @@ fn corrupt_cached_snapshot_is_ignored_on_open() {
         w.write(format!("set {k} {v}").into_bytes()).unwrap();
     }
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction());
+    assert!(w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     w.flush().unwrap();
     let expected = w.state().clone();
     drop(w);
@@ -642,7 +676,7 @@ fn corrupt_cached_snapshot_does_not_poison_compaction() {
     let (mut w, dir) = writer(&store, Kv::new());
     w.write(b"set a 1".to_vec()).unwrap();
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction());
+    assert!(w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     w.flush().unwrap();
 
     let path = cached_snapshot(dir.path());
@@ -651,7 +685,7 @@ fn corrupt_cached_snapshot_does_not_poison_compaction() {
 
     w.write(b"set b 2".to_vec()).unwrap();
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction());
+    assert!(w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     w.flush().unwrap();
     assert_eq!(w.last_compaction_error(), None);
     assert_eq!(w.stats().snapshot_lsn, Some(1));
@@ -671,7 +705,7 @@ fn replica_cache_does_not_grow_across_folds() {
         w.write(format!("set k{round} v{round}").into_bytes())
             .unwrap();
         assert!(w.compact_now());
-        assert!(w.wait_for_compaction());
+        assert!(w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
         w.flush().unwrap();
         assert!(r.refresh().unwrap());
         assert_eq!(
@@ -692,7 +726,7 @@ fn reopen_sweeps_snapshots_cached_by_an_earlier_process() {
     let (mut a, da) = writer(&store, Kv::new());
     a.write(b"set a 1".to_vec()).unwrap();
     assert!(a.compact_now());
-    assert!(a.wait_for_compaction());
+    assert!(a.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     a.flush().unwrap();
     assert_eq!(cached_snapshots(da.path()).len(), 1);
     drop(a);
@@ -702,7 +736,7 @@ fn reopen_sweeps_snapshots_cached_by_an_earlier_process() {
     for round in 0..2 {
         b.write(format!("set k{round} v").into_bytes()).unwrap();
         assert!(b.compact_now());
-        assert!(b.wait_for_compaction());
+        assert!(b.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
         b.flush().unwrap();
     }
 
@@ -731,13 +765,13 @@ fn ambiguous_fold_install_collects_the_previous_snapshot() {
 
     w.write(b"set a 1".to_vec()).unwrap();
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction());
+    assert!(w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     w.flush().unwrap();
     assert_eq!(snap_keys(&inner).len(), 1);
 
     w.write(b"set b 2".to_vec()).unwrap();
     assert!(w.compact_now());
-    assert!(w.wait_for_compaction());
+    assert!(w.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     store.fail_next_mutation_ambiguously("wal");
     w.flush().unwrap_err();
     w.refresh().unwrap();
@@ -793,7 +827,12 @@ fn write_batch_conflict_modes() {
     a.write(b"set d 4".to_vec()).unwrap();
     let batch = vec![b"set e 5".to_vec(), b"set f 6".to_vec()];
     let err = c.write_batch(batch.clone()).unwrap_err();
-    let WalError::Conflict { entries } = err else {
+    let waltier::WriteError {
+        entries,
+        source: WalError::ReconcileAborted,
+        ..
+    } = err
+    else {
         panic!("expected Conflict, got {err}")
     };
     assert_eq!(entries, batch);

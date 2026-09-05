@@ -125,7 +125,7 @@ fn unknown_store_namespace_bypasses_persistent_cache_safely() {
         let mut writer = WalTier::open(store.clone(), History, options(&shared, "")).unwrap();
         writer.write(data.to_vec()).unwrap();
         assert!(writer.compact_now());
-        assert!(writer.wait_for_compaction());
+        assert!(writer.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
         writer.flush().unwrap();
         let reopened = Replica::open(store, History, options(&shared, "")).unwrap();
         assert_eq!(reopened.state(), data);
@@ -140,7 +140,7 @@ fn offline_sweep_after_draining_and_dropping_all_writers_preserves_recovery() {
     let mut first = WalTier::open(store.clone(), History, options(&first_cache, "")).unwrap();
     first.write(b"A".to_vec()).unwrap();
     assert!(first.compact_now());
-    assert!(first.wait_for_compaction());
+    assert!(first.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     // This handle has drained its worker but deliberately abandons an uninstalled fold.
     let abandoned = store
         .keys()
@@ -190,7 +190,7 @@ fn ambiguous_snapshot_upload_is_retained_and_never_installed_as_success() {
     writer.write(b"A".to_vec()).unwrap();
     sim.fail_next_mutation_ambiguously("snap/");
     writer.compact_now();
-    assert!(!writer.wait_for_compaction());
+    assert!(writer.wait_for_compaction().is_err());
     assert!(!writer.has_pending_fold());
     let orphan = inner
         .keys()
@@ -200,7 +200,7 @@ fn ambiguous_snapshot_upload_is_retained_and_never_installed_as_success() {
     assert!(writer.last_compaction_error().unwrap().contains(&orphan));
     writer.write(b"B".to_vec()).unwrap();
     writer.compact_now();
-    assert!(writer.wait_for_compaction());
+    assert!(writer.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     writer.close().unwrap();
     assert_ne!(snapshot_key(inner.as_ref()), orphan);
     let cold = TempDir::new().unwrap();
@@ -256,7 +256,7 @@ fn reader_retries_when_superseded_snapshot_disappears_after_wal_get() {
     let mut writer = WalTier::open(store.clone(), History, options(&dir, "")).unwrap();
     writer.write(b"A".to_vec()).unwrap();
     writer.compact_now();
-    assert!(writer.wait_for_compaction());
+    assert!(writer.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     writer.flush().unwrap();
     let old_key = snapshot_key(store.as_ref());
     let (arrived_tx, arrived_rx) = mpsc::sync_channel(0);
@@ -275,7 +275,7 @@ fn reader_retries_when_superseded_snapshot_disappears_after_wal_get() {
     arrived_rx.recv().unwrap();
     writer.write(b"B".to_vec()).unwrap();
     writer.compact_now();
-    assert!(writer.wait_for_compaction());
+    assert!(writer.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     writer.flush().unwrap();
     assert!(
         store.get(&old_key).unwrap().is_none(),

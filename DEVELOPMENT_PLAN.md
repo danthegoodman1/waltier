@@ -159,12 +159,12 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 3A: Whole-batch reconciliation and single-write adapter | Missing: API implementation and dependent-batch examples. |
-| Incomplete | Work | 3B: Explicit write outcomes and recoverable attempted batches | Missing: error variants, uncertainty semantics, and retry tests. |
-| Incomplete | Work | 3C: Explicit maintenance state and truthful flush/close | Missing: replacement lifecycle contract and failed-completion regressions. |
-| Incomplete | Doc | 3D: Application guarantees and API migration | Missing: updated trait docs, examples, and release notes. |
-| Incomplete | Test | Batch conflict and maintenance outcome matrix | Missing: tests for every Phase 3 success/failure outcome. |
-| Incomplete | Gate | Completion results match durable and maintenance state | Missing: passing Phase 3 regressions and baseline suites. |
+| Complete | Work | 3A: Whole-batch reconciliation and single-write adapter | `ReconcileBatch`, replacement-aware ranges, single-write cardinality validation; `examples/batch.rs` demonstrates dependent allocations. |
+| Complete | Work | 3B: Explicit write outcomes and recoverable attempted batches | `WriteError` retains replacements and distinguishes definitely rejected from uncertain WAL PUTs. Tests cover abort, final attempt, limits, failed refresh, and ambiguous replacement. |
+| Complete | Work | 3C: Explicit maintenance state and truthful flush/close | One compaction lifecycle; explicit statuses, retry exhaustion, sticky errors/panics, explicit acknowledgement/restart, and non-panicking spawn-failure handling. |
+| Complete | Doc | 3D: Application guarantees and API migration | README and trait docs define callback equivalence/purity, prefix freshness, CAS ownership, consuming close/drop, and breaking 0.2-to-0.3 API migration. |
+| Complete | Test | Batch conflict and maintenance outcome matrix | Seventeen `tests/outcomes.rs` regressions, including immediate drop after uncertain write/flush fold installation and cold recovery. Existing callers/tests migrated. |
+| Complete | Gate | Completion results match durable and maintenance state | Independent Phase 3 review approved. Coordinator all-feature 94 tests; no-default 73; Clippy all-targets, examples in both feature modes, formatting and diff checks passed. |
 
 ## Phase 4: Shorten the commit path and choose the scaling boundary
 

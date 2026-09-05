@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use crate::cache::Cache;
 use crate::image::{ImageLimits, SnapshotRef, WalImage, check_limit};
 use crate::store::{CondGet, CondPut, ObjectStore, Stored, unique_id};
-use crate::{Entry, Lsn, Reconcile, WalApp, WalError, WalStats};
+use crate::{Entry, Lsn, MutationOutcome, ReconcileBatch, WalApp, WalError, WalStats, WriteError};
 
 /// Bound on re-reading the WAL when a concurrent compaction keeps replacing
 /// the snapshot mid-operation.
@@ -97,6 +97,42 @@ enum CompactOutcome {
     Failed(String),
 }
 
+/// Current maintenance state. A ready fold is uploaded but not yet referenced
+/// by the WAL; only `Installed` means this handle observed its installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionStatus {
+    Idle,
+    Running,
+    Ready,
+    Installed,
+    Superseded,
+}
+
+enum Compaction {
+    Idle,
+    Running(CompactionTask),
+    Ready(Fold),
+    Installed,
+    Superseded,
+    Failed(String),
+}
+
+/// An error before or during a CAS. Only the PUT boundary may mark the append
+/// unknown: a failed subsequent refresh still means this attempt did not land.
+struct InstallError {
+    source: WalError,
+    outcome: MutationOutcome,
+}
+
+impl From<WalError> for InstallError {
+    fn from(source: WalError) -> Self {
+        Self {
+            source,
+            outcome: MutationOutcome::NotApplied,
+        }
+    }
+}
+
 /// What a refresh did: whether the image advanced, and the snapshot ref it
 /// stopped pointing at. The superseded object is unreachable from the WAL,
 /// so a writer collects it; a replica only drops its cached copy.
@@ -108,6 +144,25 @@ struct Refreshed {
 struct CompactionTask {
     rx: mpsc::Receiver<CompactOutcome>,
     handle: JoinHandle<()>,
+}
+
+/// A second authoritative read naming the same missing immutable snapshot is
+/// broken storage/history, whereas changing references are ordinary contention.
+fn record_missing_snapshot(
+    previous: &mut Option<(String, String)>,
+    etag: &str,
+    key: &str,
+) -> Result<(), WalError> {
+    if previous
+        .as_ref()
+        .is_some_and(|(old_etag, old_key)| old_etag == etag && old_key == key)
+    {
+        return Err(WalError::Corrupt(format!(
+            "WAL references missing snapshot {key}"
+        )));
+    }
+    *previous = Some((etag.into(), key.into()));
+    Ok(())
 }
 
 /// Read-through snapshot fetch: disk cache first, then the store (filling
@@ -166,6 +221,7 @@ impl<A: WalApp> Core<A> {
         let cached = cache
             .load_wal(opts.max_image_bytes)
             .filter(|(_, image)| WalImage::decode(image, opts.limits()).is_ok());
+        let mut missing_snapshot = None;
         for _ in 0..MAX_RACES {
             let stored =
                 match store.get_if_changed(&wal_key, cached.as_ref().map(|(e, _)| e.as_str()))? {
@@ -210,8 +266,10 @@ impl<A: WalApp> Core<A> {
                     match fetch_snapshot(&cache, store.as_ref(), &sr.key, opts.max_snapshot_bytes)?
                     {
                         Some(bytes) => app.restore(&bytes)?,
-                        // Snapshot replaced under us; re-read the WAL.
-                        None => continue,
+                        None => {
+                            record_missing_snapshot(&mut missing_snapshot, &stored.etag, &sr.key)?;
+                            continue;
+                        }
                     }
                 }
             };
@@ -233,9 +291,10 @@ impl<A: WalApp> Core<A> {
             core.record_image_put(stored.etag, &stored.data);
             return Ok(core);
         }
-        Err(WalError::Corrupt(
-            "open kept racing with concurrent compactions".into(),
-        ))
+        Err(WalError::Contention {
+            operation: "open",
+            attempts: MAX_RACES,
+        })
     }
 
     /// The one place an accepted image version is recorded: cache, etag, size.
@@ -255,6 +314,7 @@ impl<A: WalApp> Core<A> {
             superseded: None,
         };
         let wal_key = self.opts.wal_key();
+        let mut missing_snapshot = None;
         for _ in 0..MAX_RACES {
             let stored = match self.store.get_if_changed(&wal_key, self.etag.as_deref())? {
                 CondGet::NotModified if self.etag.is_some() => return Ok(unchanged),
@@ -290,7 +350,7 @@ impl<A: WalApp> Core<A> {
                     self.opts.max_snapshot_bytes,
                 )?
                 else {
-                    // Snapshot replaced under us; re-read the WAL.
+                    record_missing_snapshot(&mut missing_snapshot, &stored.etag, &sr.key)?;
                     continue;
                 };
                 let mut state = self.app.restore(&bytes)?;
@@ -315,9 +375,10 @@ impl<A: WalApp> Core<A> {
                 superseded,
             });
         }
-        Err(WalError::Corrupt(
-            "refresh kept racing with concurrent compactions".into(),
-        ))
+        Err(WalError::Contention {
+            operation: "refresh",
+            attempts: MAX_RACES,
+        })
     }
 
     fn stats(&self) -> WalStats {
@@ -331,13 +392,12 @@ impl<A: WalApp> Core<A> {
     }
 }
 
-/// The single writer for one log. Owns the app state, appends entries with a
+/// A writer for one log. Multiple writers are allowed: CAS fences stale writes,
+/// not ownership. Owns the app state, appends entries with a
 /// CAS on the WAL object's etag, and orchestrates compaction.
 pub struct WalTier<A: WalApp> {
     core: Core<A>,
-    compaction: Option<CompactionTask>,
-    pending_fold: Option<Fold>,
-    last_compaction_error: Option<String>,
+    compaction: Compaction,
 }
 
 impl<A: WalApp> WalTier<A> {
@@ -346,92 +406,117 @@ impl<A: WalApp> WalTier<A> {
         let core = Core::open(store, Arc::new(app), opts, true)?;
         Ok(Self {
             core,
-            compaction: None,
-            pending_fold: None,
-            last_compaction_error: None,
+            compaction: Compaction::Idle,
         })
     }
 
-    /// Append one entry. Returns its LSN.
-    ///
-    /// On an etag conflict the library refreshes the state from the store and
-    /// consults [`WalApp::reconcile`]; `Abort` surfaces as
-    /// [`WalError::Conflict`] with the entry handed back.
-    pub fn write(&mut self, entry: impl Into<Vec<u8>>) -> Result<Lsn, WalError> {
-        Ok(self.write_batch(vec![entry.into()])?.start)
+    /// Append one entry and return its LSN. Uses whole-batch reconciliation but
+    /// rejects a replacement containing anything other than one entry.
+    pub fn write(&mut self, entry: impl Into<Vec<u8>>) -> Result<Lsn, WriteError> {
+        Ok(self.append(vec![entry.into()], true)?.start)
     }
 
-    /// Append a batch of entries in one commit. Returns their contiguous LSN
-    /// range. The batch is atomic — one CAS PUT carries all of it, so either
-    /// every entry lands or none does — and this is the throughput lever:
-    /// commits are serialized by the etag chain at roughly one per round
-    /// trip, but each commit can carry many entries.
-    ///
-    /// On an etag conflict the library refreshes the state, then consults
-    /// [`WalApp::reconcile`] for each entry in order against the committed
-    /// state (a `Replace` rewrite sticks); one `Abort` fails the whole batch
-    /// with [`WalError::Conflict`] handing the entries back. An empty batch
-    /// is a no-op.
+    /// Append an atomic batch in one CAS and return the final accepted range.
+    /// On a conflict, `reconcile_batch` sees refreshed committed state and the
+    /// entire pending batch. Replacements may change its length. Empty input or
+    /// an empty replacement is a no-op returning the current empty LSN range.
+    /// Errors retain the final attempted batch, including any replacements.
     pub fn write_batch(
         &mut self,
-        mut entries: Vec<Vec<u8>>,
-    ) -> Result<std::ops::Range<Lsn>, WalError> {
-        self.sync_compaction();
-        if entries.is_empty() {
-            let next = self.core.image.next_lsn();
-            return Ok(next..next);
-        }
-        let count = entries.len() as u64;
-        let mut attempts = 0u32;
-        loop {
-            let first = self.core.image.next_lsn();
-            if self.try_install(&entries)? {
-                for (i, entry) in entries.into_iter().enumerate() {
-                    self.core
-                        .app
-                        .apply(&mut self.core.state, first + i as u64, &entry);
-                    self.core.image.entries.push_back(entry);
-                }
-                self.maybe_trigger_compaction();
-                return Ok(first..first + count);
-            }
-            attempts += 1;
-            if attempts >= self.core.opts.max_write_attempts {
-                return Err(WalError::Conflict { entries });
-            }
-            let mut aborted = false;
-            for entry in entries.iter_mut() {
-                match self.core.app.reconcile(&self.core.state, entry) {
-                    Reconcile::Retry => {}
-                    Reconcile::Replace(e) => *entry = e,
-                    Reconcile::Abort => {
-                        aborted = true;
-                        break;
-                    }
-                }
-            }
-            if aborted {
-                return Err(WalError::Conflict { entries });
-            }
-        }
+        entries: Vec<Vec<u8>>,
+    ) -> Result<std::ops::Range<Lsn>, WriteError> {
+        self.append(entries, false)
     }
 
-    /// Install a pending fold without appending an entry. A no-op when
-    /// nothing is pending. Useful on idle logs and before shutdown; a busy
-    /// writer installs folds as a side effect of its next `write`.
-    pub fn flush(&mut self) -> Result<(), WalError> {
+    fn append(
+        &mut self,
+        mut entries: Vec<Vec<u8>>,
+        single: bool,
+    ) -> Result<std::ops::Range<Lsn>, WriteError> {
         self.sync_compaction();
-        let mut attempts = 0u32;
-        while self.pending_fold.is_some() {
-            if self.try_install(&[])? {
-                break;
+        for attempt in 1..=self.core.opts.max_write_attempts {
+            let first = self.core.image.next_lsn();
+            if entries.is_empty() {
+                return Ok(first..first);
             }
-            attempts += 1;
-            if attempts >= self.core.opts.max_write_attempts {
-                break;
+            match self.try_install(&entries) {
+                Ok(true) => {
+                    let count = entries.len() as u64;
+                    for (i, entry) in entries.into_iter().enumerate() {
+                        self.core
+                            .app
+                            .apply(&mut self.core.state, first + i as u64, &entry);
+                        self.core.image.entries.push_back(entry);
+                    }
+                    self.maybe_trigger_compaction();
+                    return Ok(first..first + count);
+                }
+                Err(error) => {
+                    return Err(WriteError {
+                        entries,
+                        source: error.source,
+                        outcome: error.outcome,
+                    });
+                }
+                Ok(false) => {}
+            }
+            // No callback on the final attempt: no rewritten batch will be
+            // attempted. Return the last batch actually submitted to CAS.
+            if attempt == self.core.opts.max_write_attempts {
+                return Err(WriteError {
+                    entries,
+                    source: WalError::Contention {
+                        operation: "write",
+                        attempts: attempt,
+                    },
+                    outcome: MutationOutcome::NotApplied,
+                });
+            }
+            match self.core.app.reconcile_batch(&self.core.state, &entries) {
+                ReconcileBatch::Retry => {}
+                ReconcileBatch::Replace(replacement) => {
+                    entries = replacement;
+                    if single && entries.len() != 1 {
+                        return Err(WriteError {
+                            source: WalError::InvalidReplacement {
+                                actual: entries.len(),
+                            },
+                            entries,
+                            outcome: MutationOutcome::NotApplied,
+                        });
+                    }
+                }
+                ReconcileBatch::Abort => {
+                    return Err(WriteError {
+                        entries,
+                        source: WalError::ReconcileAborted,
+                        outcome: MutationOutcome::NotApplied,
+                    });
+                }
             }
         }
-        Ok(())
+        unreachable!("options require a positive attempt budget")
+    }
+
+    /// Wait for any running compaction and install its fold without appending.
+    /// Returns its explicit final state. CAS exhaustion is an error and retains
+    /// the ready fold for retry. Compactor failures remain errors until another
+    /// compaction is started; successful appends are not undone by them.
+    pub fn flush(&mut self) -> Result<CompactionStatus, WalError> {
+        self.wait_for_compaction()?;
+        for attempt in 1..=self.core.opts.max_write_attempts {
+            if !self.has_pending_fold() {
+                return self.current_compaction_status();
+            }
+            self.try_install(&[]).map_err(|error| error.source)?;
+            if self.has_pending_fold() && attempt == self.core.opts.max_write_attempts {
+                return Err(WalError::Contention {
+                    operation: "flush",
+                    attempts: attempt,
+                });
+            }
+        }
+        self.current_compaction_status()
     }
 
     /// Pull changes other instances have written. Returns whether anything
@@ -444,41 +529,60 @@ impl<A: WalApp> WalTier<A> {
         Ok(refreshed.changed)
     }
 
-    /// Start a compaction regardless of [`WalApp::should_compact`]. Returns
-    /// whether one was started (`false` when one is already running, a fold
-    /// is pending, or there are no entries to fold).
+    /// Start a compaction regardless of `should_compact`. False means work is
+    /// running/ready, no entries need folding, or thread creation failed (visible
+    /// through `compaction_status`). Starting new work clears a previous failure.
     pub fn compact_now(&mut self) -> bool {
         self.sync_compaction();
-        if self.compaction.is_some()
-            || self.pending_fold.is_some()
+        if self.compaction_running()
+            || self.has_pending_fold()
             || self.core.image.entries.is_empty()
         {
             return false;
         }
-        self.spawn_compaction();
-        true
+        self.spawn_compaction()
     }
 
-    /// Block until a running compaction finishes. Returns whether a fold is
-    /// now pending installation (install it with `flush` or the next `write`).
-    pub fn wait_for_compaction(&mut self) -> bool {
-        let outcome = match &self.compaction {
-            None => return self.pending_fold.is_some(),
-            Some(task) => task
-                .rx
-                .recv()
-                .unwrap_or_else(|_| CompactOutcome::Failed("compaction thread died".into())),
-        };
-        self.finish_compaction(outcome);
-        self.pending_fold.is_some()
+    /// Wait for running work, returning ready, idle, installed, or superseded,
+    /// or its failure. Does not install the fold; use `flush` or the next append.
+    pub fn wait_for_compaction(&mut self) -> Result<CompactionStatus, WalError> {
+        if let Compaction::Running(task) = &self.compaction {
+            let outcome = task.rx.recv().unwrap_or_else(|_| {
+                CompactOutcome::Failed("compaction thread panicked or disconnected".into())
+            });
+            self.finish_compaction(outcome);
+        }
+        self.discard_superseded_fold();
+        self.current_compaction_status()
     }
 
-    /// Finish any running compaction and install it, then drop the handle.
-    pub fn close(mut self) -> Result<(), WalError> {
-        self.wait_for_compaction();
+    /// Observe completed background work without waiting for running work.
+    pub fn compaction_status(&mut self) -> Result<CompactionStatus, WalError> {
+        self.sync_compaction();
+        self.current_compaction_status()
+    }
+
+    fn current_compaction_status(&self) -> Result<CompactionStatus, WalError> {
+        Ok(match &self.compaction {
+            Compaction::Idle => CompactionStatus::Idle,
+            Compaction::Running(_) => CompactionStatus::Running,
+            Compaction::Ready(_) => CompactionStatus::Ready,
+            Compaction::Installed => CompactionStatus::Installed,
+            Compaction::Superseded => CompactionStatus::Superseded,
+            Compaction::Failed(error) => return Err(WalError::Compaction(error.clone())),
+        })
+    }
+
+    /// Wait for compaction and flush, then consume the handle even on error.
+    /// Use `flush(&mut self)` first when maintenance retries are wanted. A failed
+    /// close never rolls back acknowledged appends; an uninstalled snapshot may
+    /// remain as an orphan. Plain drop detaches a running compactor, which may
+    /// finish its upload but cannot install a WAL reference.
+    pub fn close(mut self) -> Result<CompactionStatus, WalError> {
         self.flush()
     }
 
+    /// Last observed committed prefix. Call `refresh` to observe newer commits.
     pub fn state(&self) -> &A::State {
         &self.core.state
     }
@@ -497,17 +601,36 @@ impl<A: WalApp> WalTier<A> {
     }
 
     pub fn compaction_running(&self) -> bool {
-        self.compaction.is_some()
+        matches!(self.compaction, Compaction::Running(_))
     }
 
     pub fn has_pending_fold(&self) -> bool {
-        self.pending_fold.is_some()
+        matches!(self.compaction, Compaction::Ready(_))
     }
 
-    /// The most recent compaction failure, if any. Failures are recorded and
-    /// compaction is simply re-attempted on a later trigger.
+    /// A recorded compaction failure, if any. Explicitly start new work with
+    /// `compact_now` or acknowledge it with `take_compaction_error`; automatic
+    /// triggers preserve failures until the caller handles them.
     pub fn last_compaction_error(&self) -> Option<&str> {
-        self.last_compaction_error.as_deref()
+        match &self.compaction {
+            Compaction::Failed(message) => Some(message),
+            _ => None,
+        }
+    }
+
+    /// Acknowledge and clear a recorded compactor failure. Already committed
+    /// data is unaffected. Use this when abandoning maintenance rather than
+    /// starting another compaction; it does not delete possible orphan uploads.
+    pub fn take_compaction_error(&mut self) -> Option<String> {
+        self.integrate_compaction();
+        if !matches!(self.compaction, Compaction::Failed(_)) {
+            return None;
+        }
+        let Compaction::Failed(message) = std::mem::replace(&mut self.compaction, Compaction::Idle)
+        else {
+            unreachable!("checked failed")
+        };
+        Some(message)
     }
 
     /// One CAS attempt: PUT the current image with any pending fold applied
@@ -515,9 +638,9 @@ impl<A: WalApp> WalTier<A> {
     /// refreshes the state and re-checks the pending fold; the caller decides
     /// whether to try again. After a win the caller pushes `extra` into the
     /// image itself.
-    fn try_install(&mut self, extra: &[Vec<u8>]) -> Result<bool, WalError> {
-        let data = match &self.pending_fold {
-            Some(f) => {
+    fn try_install(&mut self, extra: &[Vec<u8>]) -> Result<bool, InstallError> {
+        let data = match &self.compaction {
+            Compaction::Ready(f) => {
                 debug_assert!(f.applies_to(&self.core.image));
                 let skip = (f.lsn + 1 - self.core.image.first_lsn()) as usize;
                 let sr = SnapshotRef {
@@ -528,7 +651,7 @@ impl<A: WalApp> WalTier<A> {
                     .image
                     .encode_view(Some(&sr), skip, extra, self.core.opts.limits())?
             }
-            None => self
+            _ => self
                 .core
                 .image
                 .encode_view(None, 0, extra, self.core.opts.limits())?,
@@ -541,8 +664,11 @@ impl<A: WalApp> WalTier<A> {
         match self
             .core
             .store
-            .put_if_match(&self.core.opts.wal_key(), Some(&etag), &data)?
-        {
+            .put_if_match(&self.core.opts.wal_key(), Some(&etag), &data)
+            .map_err(|source| InstallError {
+                outcome: source.mutation_outcome,
+                source: WalError::Store(source),
+            })? {
             CondPut::Ok { etag } => {
                 self.core.record_image_put(etag, &data);
                 self.install_pending_fold();
@@ -561,8 +687,12 @@ impl<A: WalApp> WalTier<A> {
     /// the snapshot ref, garbage-collect the previous snapshot, and keep the
     /// new bytes in the disk cache as the base for future compactions.
     fn install_pending_fold(&mut self) {
-        let Some(f) = self.pending_fold.take() else {
+        if !self.has_pending_fold() {
             return;
+        }
+        let Compaction::Ready(f) = std::mem::replace(&mut self.compaction, Compaction::Installed)
+        else {
+            unreachable!("checked ready")
         };
         let image = &mut self.core.image;
         for _ in 0..=(f.lsn - image.first_lsn()) {
@@ -604,7 +734,9 @@ impl<A: WalApp> WalTier<A> {
     /// PUT landed even though it reported failure, so keep its bytes cached —
     /// deleting it would destroy the live snapshot.
     fn discard_superseded_fold(&mut self) {
-        let Some(f) = &self.pending_fold else { return };
+        let Compaction::Ready(f) = &self.compaction else {
+            return;
+        };
         if f.applies_to(&self.core.image) {
             return;
         }
@@ -614,7 +746,14 @@ impl<A: WalApp> WalTier<A> {
             .snapshot
             .as_ref()
             .is_some_and(|s| s.key == f.key);
-        let f = self.pending_fold.take().expect("checked above");
+        let status = if installed {
+            Compaction::Installed
+        } else {
+            Compaction::Superseded
+        };
+        let Compaction::Ready(f) = std::mem::replace(&mut self.compaction, status) else {
+            unreachable!("checked ready")
+        };
         if installed {
             self.core.cache.save_snapshot(&f.key, &f.bytes);
         } else {
@@ -624,35 +763,40 @@ impl<A: WalApp> WalTier<A> {
 
     fn integrate_compaction(&mut self) {
         let outcome = match &self.compaction {
-            None => return,
-            Some(task) => match task.rx.try_recv() {
+            Compaction::Running(task) => match task.rx.try_recv() {
                 Err(mpsc::TryRecvError::Empty) => return,
                 Ok(outcome) => outcome,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    CompactOutcome::Failed("compaction thread died".into())
+                    CompactOutcome::Failed("compaction thread panicked or disconnected".into())
                 }
             },
+            _ => return,
         };
         self.finish_compaction(outcome);
     }
 
     fn finish_compaction(&mut self, outcome: CompactOutcome) {
-        let task = self.compaction.take().expect("a compaction is running");
-        let _ = task.handle.join();
-        match outcome {
-            CompactOutcome::Done(fold) => {
-                self.pending_fold = Some(fold);
-                self.discard_superseded_fold();
+        let Compaction::Running(task) = std::mem::replace(&mut self.compaction, Compaction::Idle)
+        else {
+            unreachable!("a compaction is running")
+        };
+        self.compaction = if task.handle.join().is_err() {
+            Compaction::Failed("compaction thread panicked".into())
+        } else {
+            match outcome {
+                CompactOutcome::Done(fold) => Compaction::Ready(fold),
+                CompactOutcome::Failed(message) => Compaction::Failed(message),
             }
-            CompactOutcome::Failed(msg) => self.last_compaction_error = Some(msg),
-        }
+        };
+        self.discard_superseded_fold();
     }
 
     /// Called after each successful write. `compact_now` re-verifies
     /// eligibility, so the guard lives in one place.
     fn maybe_trigger_compaction(&mut self) {
-        if self.compaction.is_none()
-            && self.pending_fold.is_none()
+        if !self.compaction_running()
+            && !self.has_pending_fold()
+            && !matches!(self.compaction, Compaction::Failed(_))
             && !self.core.image.entries.is_empty()
             && self.core.app.should_compact(&self.core.stats())
         {
@@ -660,7 +804,7 @@ impl<A: WalApp> WalTier<A> {
         }
     }
 
-    fn spawn_compaction(&mut self) {
+    fn spawn_compaction(&mut self) -> bool {
         let app = self.core.app.clone();
         let store = self.core.store.clone();
         let cache = self.core.cache.clone();
@@ -685,18 +829,29 @@ impl<A: WalApp> WalTier<A> {
         let snap_prefix = format!("{}snap/{fold_lsn:020}-", self.core.opts.prefix);
         let max_snapshot_bytes = self.core.opts.max_snapshot_bytes;
         let (tx, rx) = mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let _ = tx.send(run_compaction(
-                app,
-                store,
-                cache,
-                base_key,
-                entries,
-                snap_prefix,
-                max_snapshot_bytes,
-            ));
-        });
-        self.compaction = Some(CompactionTask { rx, handle });
+        let handle = std::thread::Builder::new()
+            .name("waltier-compact".into())
+            .spawn(move || {
+                let _ = tx.send(run_compaction(
+                    app,
+                    store,
+                    cache,
+                    base_key,
+                    entries,
+                    snap_prefix,
+                    max_snapshot_bytes,
+                ));
+            });
+        match handle {
+            Ok(handle) => {
+                self.compaction = Compaction::Running(CompactionTask { rx, handle });
+                true
+            }
+            Err(error) => {
+                self.compaction = Compaction::Failed(format!("start compactor: {error}"));
+                false
+            }
+        }
     }
 }
 
@@ -791,6 +946,7 @@ impl<A: WalApp> Replica<A> {
         Ok(self.core.refresh()?.changed)
     }
 
+    /// Last observed committed prefix. Call `refresh` to observe newer commits.
     pub fn state(&self) -> &A::State {
         &self.core.state
     }

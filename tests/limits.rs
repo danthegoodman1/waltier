@@ -109,8 +109,11 @@ fn image_byte_boundary_rejects_whole_batch_before_publication() {
     let puts = store.puts.load(Ordering::SeqCst);
     assert!(matches!(
         wal.write_batch(vec![b"c".to_vec(), b"d".to_vec()]),
-        Err(WalError::LimitExceeded {
-            resource: "WAL image bytes",
+        Err(waltier::WriteError {
+            source: WalError::LimitExceeded {
+                resource: "WAL image bytes",
+                ..
+            },
             ..
         })
     ));
@@ -141,15 +144,18 @@ fn held_compaction_applies_backpressure_then_recovers() {
     let puts = store.puts.load(Ordering::SeqCst);
     assert!(matches!(
         wal.write(b"c"),
-        Err(WalError::LimitExceeded {
-            resource: "live entries",
+        Err(waltier::WriteError {
+            source: WalError::LimitExceeded {
+                resource: "live entries",
+                ..
+            },
             ..
         })
     ));
     assert_eq!(store.puts.load(Ordering::SeqCst), puts);
     assert_eq!(wal.state(), b"ab");
     release_tx.send(()).unwrap();
-    assert!(wal.wait_for_compaction());
+    assert!(wal.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     assert_eq!(wal.write(b"c").unwrap(), 2);
     assert_eq!(wal.stats().live_entries, 2);
     let cold = TempDir::new().unwrap();
@@ -170,10 +176,13 @@ fn repeated_compaction_failure_cannot_grow_past_the_budget() {
     wal.write(b"a").unwrap();
     for _ in 0..3 {
         assert!(wal.compact_now());
-        assert!(!wal.wait_for_compaction());
+        assert!(wal.wait_for_compaction().is_err());
         assert!(matches!(
             wal.write(b"b"),
-            Err(WalError::LimitExceeded { .. })
+            Err(waltier::WriteError {
+                source: WalError::LimitExceeded { .. },
+                ..
+            })
         ));
     }
     assert_eq!(
@@ -183,7 +192,7 @@ fn repeated_compaction_failure_cannot_grow_past_the_budget() {
     );
     fail.store(false, Ordering::SeqCst);
     assert!(wal.compact_now());
-    assert!(wal.wait_for_compaction());
+    assert!(wal.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     wal.write(b"b").unwrap();
     let cold = TempDir::new().unwrap();
     assert_eq!(
@@ -204,7 +213,7 @@ fn oversized_snapshot_is_never_uploaded_or_installed() {
     wal.write(b"ab").unwrap();
     let puts = store.puts.load(Ordering::SeqCst);
     wal.compact_now();
-    assert!(!wal.wait_for_compaction());
+    assert!(wal.wait_for_compaction().is_err());
     assert!(
         wal.last_compaction_error()
             .unwrap()
@@ -232,7 +241,10 @@ fn store_limit_caps_wal_acceptance_and_read_limits() {
     wal.write(b"a").unwrap();
     assert!(matches!(
         wal.write(b"b"),
-        Err(WalError::LimitExceeded { limit: 14, .. })
+        Err(waltier::WriteError {
+            source: WalError::LimitExceeded { limit: 14, .. },
+            ..
+        })
     ));
     let cold = TempDir::new().unwrap();
     assert_eq!(
@@ -333,12 +345,24 @@ fn final_lsn_rejects_append_before_cas_and_still_compacts() {
     let mut wal = WalTier::open(store.clone(), History::plain(), Options::new(dir.path())).unwrap();
     assert_eq!(wal.tip(), Some(u64::MAX - 1));
     assert_eq!(wal.state(), b"ab");
-    assert!(matches!(wal.write(b"c"), Err(WalError::LsnExhausted)));
+    assert!(matches!(
+        wal.write(b"c"),
+        Err(waltier::WriteError {
+            source: WalError::LsnExhausted,
+            ..
+        })
+    ));
     assert_eq!(store.puts.load(Ordering::SeqCst), 0);
     wal.compact_now();
-    assert!(wal.wait_for_compaction());
+    assert!(wal.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     wal.flush().unwrap();
-    assert!(matches!(wal.write(b"c"), Err(WalError::LsnExhausted)));
+    assert!(matches!(
+        wal.write(b"c"),
+        Err(waltier::WriteError {
+            source: WalError::LsnExhausted,
+            ..
+        })
+    ));
     let cold = TempDir::new().unwrap();
     let reader = Replica::open(store, History::plain(), Options::new(cold.path())).unwrap();
     assert_eq!(reader.tip(), Some(u64::MAX - 1));
@@ -354,7 +378,7 @@ fn snapshot_at_exact_budget_recovers_and_smaller_reader_rejects() {
     let mut wal = WalTier::open(store.clone(), History::plain(), opts).unwrap();
     wal.write(b"ab").unwrap();
     wal.compact_now();
-    assert!(wal.wait_for_compaction());
+    assert!(wal.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     wal.flush().unwrap();
     for cache in [dir, TempDir::new().unwrap()] {
         let mut opts = Options::new(cache.path());

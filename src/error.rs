@@ -76,13 +76,20 @@ pub enum WalError {
     #[error("LSN space exhausted")]
     LsnExhausted,
 
-    /// The WAL changed under a write and the app declined to retry. The
-    /// state has been refreshed; `entries` are the pending entries (one for
-    /// `write`, the whole batch for `write_batch`, with any `Replace`
-    /// rewrites applied), returned so the caller can re-validate and
-    /// resubmit.
-    #[error("write conflict: the WAL changed and the app declined to retry")]
-    Conflict { entries: Vec<Vec<u8>> },
+    #[error("application aborted batch reconciliation")]
+    ReconcileAborted,
+
+    #[error("{operation} contention budget exhausted after {attempts} attempts")]
+    Contention {
+        operation: &'static str,
+        attempts: u32,
+    },
+
+    #[error("write requires exactly one replacement entry, got {actual}")]
+    InvalidReplacement { actual: usize },
+
+    #[error("compaction: {0}")]
+    Compaction(String),
 
     #[error("storage: {0}")]
     Store(#[from] StoreError),
@@ -96,4 +103,16 @@ pub enum WalError {
     /// Error surfaced by a [`crate::WalApp`] method.
     #[error("app: {0}")]
     App(String),
+}
+
+/// A failed append, with ownership of the final attempted batch. A replacement
+/// is retained even when it subsequently fails validation or storage access.
+#[derive(Debug, Error)]
+#[error("{source} (append outcome: {outcome:?})")]
+pub struct WriteError {
+    pub entries: Vec<Vec<u8>>,
+    #[source]
+    pub source: WalError,
+    /// Refers to this append, not to earlier appends or maintenance work.
+    pub outcome: MutationOutcome,
 }
