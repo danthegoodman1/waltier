@@ -54,7 +54,8 @@ pub(crate) fn unique_id() -> io::Result<String> {
 /// data and validators; conditional replacement must be atomic and strongly
 /// consistent. A successful PUT is the durable commit point (except the
 /// explicitly development-only local stores). ETags are opaque, object-scoped
-/// validators: they may repeat for identical content, as on S3.
+/// validators: equal validators for one key must imply identical bytes. They
+/// may repeat for identical content, as on S3.
 ///
 /// Applications must reserve the WAL and snapshot keys for WalTier. In
 /// particular, snapshots are immutable and must never be overwritten or

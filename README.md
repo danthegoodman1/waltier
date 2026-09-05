@@ -20,6 +20,7 @@ It's the generalized core of the pattern in [Cursor's "git at any scale"](https:
 - [Resource limits](#resource-limits)
 - [Object stores](#object-stores)
 - [Testing](#testing)
+  - [Real S3 conformance](#real-s3-conformance)
 - [Benchmarks](#benchmarks)
 - [What WalTier doesn't do](#what-waltier-doesnt-do)
 
@@ -140,7 +141,7 @@ Cache setup and writes are best effort: an unavailable directory does not preven
 - CAS prevents a stale writer from overwriting newer history. It does not grant exclusive ownership: multiple writers can successfully alternate commits after reconciling.
 - `WriteError.outcome == MutationOutcome::Unknown` can hide a PUT that landed, such as a timeout after S3 applied it. The error retains the candidate entries; WalTier returns without locally applying or retrying that candidate. Refresh, then inspect application request IDs before deciding whether to resubmit. Refresh can discover the uncertain entries. Caller resubmission can append duplicates, so use stable request IDs or idempotent commands; this is not exactly-once delivery.
 - Snapshots use random 128-bit IDs and create-only PUTs. A key collision is retried without overwriting the existing object. Failed uploads can leave possible orphan objects; the compaction error names the candidate key. An ambiguous WAL installation never authorizes deleting its candidate snapshot.
-- Orphan sweeping is supported **only offline**: stop new writes, drain or terminate every writer and compaction/publication request, and discard all old handles so no pending fold can later install. After that, reread the authoritative WAL, keep its referenced snapshot, delete other objects under that WAL’s `snap/` prefix, and reopen writers. A pending upload or fold is not garbage merely because the current WAL does not reference it. Rereading the WAL during an online sweep, or adding a minimum object age, does not make that sweep safe. Do not use age-based expiration: it can delete the live snapshot of an idle log.
+- Orphan sweeping is supported **only offline**: stop new writes, discard all old handles, and establish that every old backend mutation has finished or can no longer apply, including compaction uploads and uncertain WAL CAS requests. Client cancellation, thread join, drop, close, an `Unknown` timeout, or one fresh WAL GET does not by itself establish backend completion: a delayed CAS could still install its snapshot afterward. Do not sweep while that uncertainty remains. Once backend quiescence is established, reread the authoritative WAL, keep its referenced snapshot, delete other objects under that WAL’s `snap/` prefix, and reopen writers. A pending upload or fold is not garbage merely because the current WAL does not reference it. Rereading the WAL during an online sweep, or adding a minimum object age, does not make that sweep safe. Do not use age-based expiration: it can delete the live snapshot of an idle log.
 - Explicit cleanup may delete a snapshot proven superseded by an accepted WAL transition. A reader racing that deletion rereads the WAL and reconstructs from its newer snapshot. Repeated changing references exhaust a `Contention` budget; two authoritative reads of the same version referencing a missing snapshot return `Corrupt`. Local cache cleanup only removes disposable files.
 
 ## Application contract
@@ -151,7 +152,7 @@ Callbacks must return without panicking. A foreground callback panic can happen 
 
 ## API migration
 
-This is a breaking API update from 0.2, intended for 0.3. The `WTL1` object format is unchanged. Update append error handling from `WalError::Conflict { entries }` to `WriteError { entries, source, outcome }`; application rejection is `WalError::ReconcileAborted`, while retry exhaustion is `WalError::Contention`. Inspect `outcome` before resubmitting, and keep `entries` when propagating failures. Whole-batch overrides use `ReconcileBatch`; existing independent-entry `reconcile` implementations continue to work through its default adapter.
+Version 0.3 is a breaking API update from 0.2 and requires Rust 1.89 or later. The `WTL1` object format is unchanged. Update append error handling from `WalError::Conflict { entries }` to `WriteError { entries, source, outcome }`; application rejection is `WalError::ReconcileAborted`, while retry exhaustion is `WalError::Contention`. Inspect `outcome` before resubmitting, and keep `entries` when propagating failures. Whole-batch overrides use `ReconcileBatch`; existing independent-entry `reconcile` implementations continue to work through its default adapter.
 
 Replace boolean `wait_for_compaction()` checks with its `Result<CompactionStatus, WalError>`. `flush` and `close` return `MaintenanceStatus { compaction, garbage }`, wait for running work, and surface compaction or cleanup failures. Inspect the garbage report for offline-sweep debt. Handle a failed compactor explicitly instead of relying on automatic retry. See the object-store section for `StoreError` and filesystem-root migration.
 
@@ -179,9 +180,30 @@ Storage failures expose `StoreError { message, operation, key, status, mutation_
 
 ## Testing
 
-`cargo test` runs unit tests, integration tests (fencing, all reconcile modes, competing compactions, ambiguous failures), and **deterministic simulation tests**: seeded runs interleave writes, refreshes, compactions, and crash/reopen cycles across writers and replicas, with and without injected store faults. An oracle checks after every step that the committed history only grows, every instance's state is an exact prefix of it, and no snapshot object leaks or vanishes. A run is a pure function of its seed — reproduce with `DST_SEED=<seed>`, watch with `DST_TRACE=1`, scale with `DST_SEEDS` / `DST_STEPS`.
+`cargo test` runs codec/cache/store tests, targeted correctness regressions, local HTTP transport tests, and two complementary simulation suites:
 
-The `waltier::sim` module (feature `sim`, on by default) provides the seeded RNG and `SimStore` — fault injection and a latency model — and works just as well for testing apps built on WalTier.
+- `tests/dst.rs` keeps the existing seeded Abort/Retry/Replace interleavings across writers and replicas. It settles each compactor and services cleanup between steps; its Replica-based history checks are supplementary.
+- `tests/concurrency.rs` places a recording store **below fault injection**, so it observes successful CAS operations even when their responses are lost. A separate WTL1/snapshot parser reconstructs authoritative history without calling Replica or the application's snapshot decoder. Every appended tail must equal a registered submitted batch; returned acknowledgement ranges must match those original commands, and uncertain attempts must be absent or complete. Live, cold, and warm states are compared with this independent history.
+
+The independent suite audits actual object bytes and snapshot identities under clean and ambiguous faults, tracks candidate ownership and uncertain installations, rejects deletion of live or still-installable pending snapshots, and verifies cleanup after faults stop. Offline test sweeping occurs only after the scheduled writers/workers are drained. Negative oracle tests deliberately supply wrong ranges, truncated/changed/reordered history, partial/reordered/duplicated uncertain attempts, unsafe pending deletion, and a missing live snapshot; each must be rejected.
+
+Both seeded suites settle compactors to make their schedules reproducible. Separate channel-controlled tests overlap actual threads during snapshot upload, writer drop with active compaction, a delayed lost mutation response, and a reader's WAL/snapshot fetch racing replacement and deletion. They use explicit release barriers, with timeouts only to prevent hung tests. A same-seed test compares normalized logical traces, replacing random snapshot IDs with candidate ordinals.
+
+Reproduce the legacy suite with `DST_SEED=<seed>` and `DST_TRACE=1`; scale it with `DST_SEEDS` and `DST_STEPS`. The independent corpus uses `ORACLE_SEED`, `ORACLE_TRACE`, `ORACLE_SEEDS`, and `ORACLE_STEPS` (default 24 seeds, each clean and faulted, at 200 steps). The `waltier::sim` module supplies seeded fault/latency injection for application tests as well.
+
+CI checks all features, no default features, S3 alone, and simulation alone; formatting and Clippy; release codec/limits/outcomes; the group-commit example's backpressure/receipt/shutdown tests; expanded deterministic corpora; and Rust 1.89 across all targets. To run the example tests locally, use `cargo test --all-features --example group_commit`.
+
+### Real S3 conformance
+
+**Actual S3 service conformance has not been verified for this change.** Local HTTP transport tests pass independently of credentials. The ignored service test in `tests/s3_conformance.rs` checks create-only publication, conditional reads, two competing CAS requests, immutable objects, and cold WAL recovery against an explicitly configured endpoint.
+
+Set `WALTIER_S3_TEST_ENDPOINT`, `WALTIER_S3_TEST_REGION`, `WALTIER_S3_TEST_BUCKET`, `WALTIER_S3_TEST_ACCESS_KEY`, `WALTIER_S3_TEST_SECRET_KEY`, `WALTIER_S3_TEST_PATH_STYLE` (`true` or `false`), and `WALTIER_S3_TEST_PREFIX` (a nonempty reserved test prefix ending in `/`). Supply credentials through your environment or secret manager, then run:
+
+```sh
+cargo test --locked --no-default-features --features s3 --test s3_conformance -- --ignored --nocapture
+```
+
+The test acquires a create-only reservation under a random subprefix, restricts its operations to that subprefix, and removes only confirmed-created objects after writers and requests finish. On failure it retains the prefix for inspection; there is no automatic cleanup that could race an uncertain or unfinished mutation. The output names the test prefix and does not print credentials. Ordinary tests and CI never run this service test. Record the endpoint/backend and passing run before claiming service conformance.
 
 ## Benchmarks
 

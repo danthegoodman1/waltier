@@ -233,8 +233,8 @@ fn fetch_snapshot(
 }
 
 /// State shared by writer and replica: the synced image, the app state built
-/// from it, and the local cache. Snapshot bytes live in the disk cache, never
-/// in memory.
+/// from it, and the optional local cache. Snapshot bytes are allocated during
+/// fetch/compaction but are not retained in Core between operations.
 struct Core<A: WalApp> {
     app: Arc<A>,
     store: Arc<dyn ObjectStore>,
@@ -990,7 +990,7 @@ fn run_compaction<A: WalApp>(
             Ok(Some(bytes)) => Some(bytes),
             Ok(None) => {
                 return CompactOutcome::Failed(format!(
-                    "base snapshot {key} is gone; a later trigger will retry"
+                    "base snapshot {key} is gone; refresh and explicitly restart compaction"
                 ));
             }
             Err(e) => return CompactOutcome::Failed(e.to_string()),
