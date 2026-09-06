@@ -1,5 +1,7 @@
 # Performance comparison
 
+**This is the initial three-run measurement.** The [performance investigation](PERFORMANCE_INVESTIGATION.md) contains the subsequent fixes, final six-round comparison, causal diagnostics and remaining regressions. The original tables below are preserved as evidence.
+
 Fold-install acknowledgement p99 fell from **31.01 to 15.42 ms** at 15 ms simulated RTT. A prepared 16 MiB snapshot now retains about **16 MiB less heap**. Explicit-flush caching also reduces local append cost. Total deletion work and peak compaction heap are essentially unchanged; the slower cold-open and startup measurements are included below.
 
 The baseline is `d5dda89fb176d590d03c7812d047ced2712bba94`, the reviewed `main`. Candidate measurements include this PR’s correctness and performance changes. All figures are medians of three release runs with Rust 1.97.0 on the same machine. [performance-results.json](performance-results.json) contains every run, compiler/platform metadata, and the candidate HEAD/working-change marker. These are MemoryStore/SimStore measurements, not actual S3 results.

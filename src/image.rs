@@ -107,29 +107,38 @@ impl WalImage {
         limits: ImageLimits,
     ) -> Result<Vec<u8>, WalError> {
         let snapshot = snapshot.or(self.snapshot.as_ref());
-        let count = self
+        let Some(count) = self
             .entries
             .len()
             .checked_sub(skip)
             .and_then(|kept| kept.checked_add(extra.len()))
-            .ok_or(WalError::LsnExhausted)?;
+        else {
+            return Err(WalError::LsnExhausted);
+        };
         check_limit("live entries", count, limits.entries.min(u32::MAX as usize))?;
-        check_lsn(snapshot, count).ok_or(WalError::LsnExhausted)?;
+        if check_lsn(snapshot, count).is_none() {
+            return Err(WalError::LsnExhausted);
+        }
         let mut size = 9usize;
         if let Some(s) = snapshot {
             check_limit("snapshot key bytes", s.key.len(), u32::MAX as usize)?;
-            size = size
+            let Some(next_size) = size
                 .checked_add(12)
                 .and_then(|n| n.checked_add(s.key.len()))
-                .ok_or(WalError::LsnExhausted)?;
+            else {
+                return Err(WalError::LsnExhausted);
+            };
+            size = next_size;
         }
         let entries = self.entries.iter().skip(skip).chain(extra.iter());
         for e in entries.clone() {
             check_limit("entry bytes", e.len(), u32::MAX as usize)?;
-            size = size
-                .checked_add(4)
-                .and_then(|n| n.checked_add(e.len()))
-                .ok_or(WalError::LsnExhausted)?;
+            // Construct errors only on failure. Eager `ok_or` can make the
+            // compiler drop a WalError on every successful entry check.
+            let Some(next_size) = size.checked_add(4).and_then(|n| n.checked_add(e.len())) else {
+                return Err(WalError::LsnExhausted);
+            };
+            size = next_size;
         }
         check_limit("WAL image bytes", size, limits.bytes)?;
         let mut out = Vec::with_capacity(size);

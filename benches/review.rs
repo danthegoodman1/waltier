@@ -96,14 +96,18 @@ fn install_latency() {
     );
 }
 fn sustained(batch: usize, rtt_ms: u64, entry_bytes: usize) {
+    sustained_folds(batch, rtt_ms, entry_bytes, 12);
+}
+
+fn sustained_folds(batch: usize, rtt_ms: u64, entry_bytes: usize, folds: usize) {
     let store = store(rtt_ms);
     let dir = TempDir::new().unwrap();
     let mut wal = WalTier::open(store.clone(), Count, Options::new(dir.path())).unwrap();
     let start = Instant::now();
     let before = store.stats();
     let mut times = Vec::new();
-    // Twelve folds, each over sixteen commits: every batch sees the same schedule.
-    for _ in 0..12 {
+    // Sixteen commits per fold: every version sees the same schedule.
+    for _ in 0..folds {
         for _ in 0..16 {
             let entries = vec![vec![0; entry_bytes]; batch];
             let t = Instant::now();
@@ -115,10 +119,12 @@ fn sustained(batch: usize, rtt_ms: u64, entry_bytes: usize) {
         assert!(wal.has_pending_fold());
         wal.flush().unwrap();
     }
-    let entries = 12 * 16 * batch;
+    let entries = folds * 16 * batch;
     assert_eq!(*wal.state(), entries as u64);
     wal.close().unwrap();
-    let label = if entry_bytes == 64 {
+    let label = if folds != 12 {
+        format!("extended_batch{batch}_rtt{rtt_ms}")
+    } else if entry_bytes == 64 {
         format!("steady_batch{batch}_rtt{rtt_ms}")
     } else {
         format!("steady_batch{batch}_rtt{rtt_ms}_entry{entry_bytes}")
@@ -200,6 +206,12 @@ fn compaction_lag() {
     );
 }
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--small") {
+        // Extend the otherwise ~10 ms zero-latency sample for regression work.
+        sustained_folds(64, 0, 64, 120);
+        sustained(64, 1, 64);
+        return;
+    }
     install_latency();
     for batch in [1, 8, 64, 256] {
         sustained(batch, 1, 64);
@@ -207,4 +219,5 @@ fn main() {
     sustained(64, 0, 64);
     sustained(64, 1, 4096);
     compaction_lag();
+    sustained_folds(64, 0, 64, 120);
 }

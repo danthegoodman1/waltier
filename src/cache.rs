@@ -39,16 +39,21 @@ fn write_atomic_with(
 ) -> io::Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let (tmp, mut file) = loop {
-        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
-        let tmp = parent.join(format!(".waltier-{}-{seq}.tmp", std::process::id()));
+    let pid = std::process::id();
+    // Reuse the common filename after publication removes it. Exclusive
+    // creation still separates overlapping writers and stale temporary files.
+    let mut tmp = parent.join(format!(".waltier-{pid}.tmp"));
+    let mut file = loop {
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)
         {
-            Ok(file) => break (tmp, file),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Ok(file) => break file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+                tmp = parent.join(format!(".waltier-{pid}-{seq}.tmp"));
+            }
             Err(e) => return Err(e),
         }
     };
@@ -129,23 +134,6 @@ fn read_checked(path: &Path, max_payload: usize) -> Option<Vec<u8>> {
     Some(payload.to_vec())
 }
 
-fn write_checked(path: &Path, parts: &[&[u8]]) {
-    let Some(total) = parts.iter().try_fold(0usize, |n, p| n.checked_add(p.len())) else {
-        return;
-    };
-    let mut header = [0; HEADER];
-    header[..4].copy_from_slice(MAGIC);
-    header[4..12].copy_from_slice(&checksum_parts(total, parts).to_le_bytes());
-    header[12..].copy_from_slice(&(total as u64).to_le_bytes());
-    let _ = write_atomic_with(path, |file| {
-        file.write_all(&header)?;
-        for part in parts {
-            file.write_all(part)?;
-        }
-        Ok(())
-    });
-}
-
 #[derive(Clone)]
 pub(crate) struct Cache {
     dir: PathBuf,
@@ -217,7 +205,8 @@ impl Cache {
         self.save(
             &self.wal_path(),
             b"wal",
-            &[&(etag.len() as u16).to_le_bytes(), etag.as_bytes(), image],
+            &[&(etag.len() as u16).to_le_bytes(), etag.as_bytes()],
+            image,
         );
     }
 
@@ -230,7 +219,7 @@ impl Cache {
         if self.identity.is_none() {
             return;
         }
-        self.save(&self.snap_path(key), key.as_bytes(), &[data]);
+        self.save(&self.snap_path(key), key.as_bytes(), &[], data);
     }
 
     fn load(&self, path: &Path, key: &[u8], max_data: usize) -> Option<Vec<u8>> {
@@ -249,17 +238,35 @@ impl Cache {
         Some(rest.get(8..)?.strip_prefix(key)?.to_vec())
     }
 
-    fn save(&self, path: &Path, key: &[u8], data: &[&[u8]]) {
+    fn save(&self, path: &Path, key: &[u8], fields: &[&[u8]], body: &[u8]) {
         let Some(identity) = &self.identity else {
             return;
         };
-        let length = (key.len() as u64).to_le_bytes();
-        // Only the small list of borrowed slices is allocated, never the image
-        // or snapshot body. WTC2 identity and checksum coverage are unchanged.
-        let mut parts = Vec::with_capacity(3 + data.len());
-        parts.extend_from_slice(&[identity.as_slice(), &length, key]);
-        parts.extend_from_slice(data);
-        write_checked(path, &parts);
+        let Some(prefix_len) = [HEADER, identity.len(), 8, key.len()]
+            .into_iter()
+            .chain(fields.iter().map(|field| field.len()))
+            .try_fold(0usize, |total, len| total.checked_add(len))
+        else {
+            return;
+        };
+        let Some(payload_len) = (prefix_len - HEADER).checked_add(body.len()) else {
+            return;
+        };
+        // Combine only framing and metadata. Publish with two writes while
+        // borrowing the image/snapshot body instead of copying it into a frame.
+        let mut prefix = Vec::with_capacity(prefix_len);
+        prefix.resize(HEADER, 0);
+        prefix.extend_from_slice(identity);
+        prefix.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        prefix.extend_from_slice(key);
+        for field in fields {
+            prefix.extend_from_slice(field);
+        }
+        let sum = checksum_parts(payload_len, &[&prefix[HEADER..], body]);
+        prefix[..4].copy_from_slice(MAGIC);
+        prefix[4..12].copy_from_slice(&sum.to_le_bytes());
+        prefix[12..HEADER].copy_from_slice(&(payload_len as u64).to_le_bytes());
+        let _ = write_atomic(path, &[&prefix, body]);
     }
 
     pub fn remove_snapshot(&self, key: &str) {
@@ -455,6 +462,54 @@ mod tests {
     }
 
     #[test]
+    fn atomic_writers_preserve_an_existing_preferred_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let preferred = dir
+            .path()
+            .join(format!(".waltier-{}.tmp", std::process::id()));
+        fs::write(&preferred, b"another writer's temporary bytes").unwrap();
+        let path = dir.path().join("object");
+        write_atomic(&path, &[b"new version"]).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new version");
+        assert_eq!(
+            fs::read(&preferred).unwrap(),
+            b"another writer's temporary bytes"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn overlapping_atomic_writers_publish_only_their_own_complete_frames() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object");
+        let (prepared, preparation) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let path = &path;
+            let first = scope.spawn(move || {
+                write_atomic_with(path, |file| {
+                    file.write_all(b"first-")?;
+                    prepared.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    file.write_all(b"complete")
+                })
+            });
+            preparation.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The first writer owns the preferred name until it is released.
+            let second = write_atomic(path, &[b"second-complete"]);
+            let published = fs::read(path);
+            release.send(()).unwrap();
+            first.join().unwrap().unwrap();
+            second.unwrap();
+            assert_eq!(published.unwrap(), b"second-complete");
+        });
+        assert_eq!(fs::read(path).unwrap(), b"first-complete");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn checksum_separates_content_and_length() {
         assert_ne!(checksum(b""), checksum(b"\0"));
         assert_ne!(checksum(b"abcdefgh"), checksum(b"abcdefgi"));
@@ -496,6 +551,57 @@ mod tests {
             *corrupted.last_mut().unwrap() ^= 1;
             fs::write(cache.wal_path(), corrupted).unwrap();
             assert!(cache.load_wal(bytes.len()).is_none());
+        }
+    }
+
+    #[test]
+    fn cache_frames_preserve_wtc2_with_empty_and_large_metadata() {
+        fn frame(payload: &[u8]) -> Vec<u8> {
+            [
+                MAGIC.as_slice(),
+                &checksum(payload).to_le_bytes(),
+                &(payload.len() as u64).to_le_bytes(),
+                payload,
+            ]
+            .concat()
+        }
+        for (namespace_len, key_len, etag_len, body_len) in
+            [(0, 0, 0, 0), (1, 7, 9, 31), (8192, 16384, 65535, 65536)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let namespace = "n".repeat(namespace_len);
+            let key = "k".repeat(key_len);
+            let etag = "e".repeat(etag_len);
+            let body = vec![0x5a; body_len];
+            let cache = Cache::new(dir.path(), Some(&namespace), "wal");
+            let identity = format!("{namespace_len}:{namespace}3:wal");
+
+            let wal_payload = [
+                identity.as_bytes(),
+                &3u64.to_le_bytes(),
+                b"wal",
+                &(etag_len as u16).to_le_bytes(),
+                etag.as_bytes(),
+                &body,
+            ]
+            .concat();
+            cache.save_wal(&etag, &body);
+            assert_eq!(fs::read(cache.wal_path()).unwrap(), frame(&wal_payload));
+            assert_eq!(cache.load_wal(body_len), Some((etag, body.clone())));
+
+            let snap_payload = [
+                identity.as_bytes(),
+                &(key_len as u64).to_le_bytes(),
+                key.as_bytes(),
+                &body,
+            ]
+            .concat();
+            cache.save_snapshot(&key, &body);
+            assert_eq!(
+                fs::read(cache.snap_path(&key)).unwrap(),
+                frame(&snap_payload)
+            );
+            assert_eq!(cache.load_snapshot(&key, body_len), Some(body));
         }
     }
 

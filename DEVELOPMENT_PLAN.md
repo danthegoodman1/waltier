@@ -1,6 +1,6 @@
 # WalTier development plan
 
-Reviewed `main` at `d5dda89fb176d590d03c7812d047ced2712bba94` on 2026-09-04. All five implementation phases are complete on [PR #5](https://github.com/danthegoodman1/waltier/pull/5), with independent review, local validation and passing remote CI. Phase ledgers record the evidence; review findings describe the original baseline. Actual S3 service conformance remains explicitly unverified.
+Reviewed `main` at `d5dda89fb176d590d03c7812d047ced2712bba94` on 2026-09-04. The first five implementation phases are complete on [PR #5](https://github.com/danthegoodman1/waltier/pull/5), with independent review, local validation and passing remote CI. Phase 6 investigates and restores measured performance regressions. Phase ledgers record the evidence; review findings describe the original baseline. Actual S3 service conformance remains explicitly unverified.
 
 ## Overarching goal
 
@@ -230,3 +230,32 @@ Status ledger:
 | Complete | Work | 5D: CI, service conformance, and migration gates | `.github/workflows/ci.yml` covers four feature configurations, quality/release/corpus and MSRV. `tests/s3_conformance.rs` is explicitly opt-in with an isolated reserved prefix and no failure cleanup. Cargo/README identify 0.3 and Rust 1.89; authoritative WTL1 remains unchanged. Actual S3 was not run or claimed. |
 | Complete | Test | Expanded schedules, seed corpus, and oracle sensitivity checks | Seven independent tests pass, including negative range/history/order/uncertainty/deletion checks. `ORACLE_SEEDS=48 ORACLE_STEPS=400 cargo test --locked --all-features --test concurrency` passes 38,400 scheduled steps, 15,698 acknowledgements and 5,977 snapshot installs. Legacy Abort/Retry/Replace DST also passes `DST_SEEDS=80 DST_STEPS=400 cargo test --locked --all-features --test dst` (64,000 scheduled steps) as supplementary evidence. |
 | Complete | Gate | Independently verified concurrent recovery and release evidence | Independent Phase 5 review approved. Local all-feature 110 (+1 ignored service test), no-default 82, S3-only 91 (+1 ignored), sim-only 101, release codec/limits/outcomes 33, example tests 3, MSRV 1.89 all-targets, Clippy, formatting and diff checks pass. All six [remote CI jobs](https://github.com/danthegoodman1/waltier/actions/runs/33939177782) pass at `09d9e1c`, including expanded corpora and release tests. The current-stable Clippy iterator fix passed independent re-review, cache/outcome tests and a three-run cache recheck recorded in `PERFORMANCE.md`. Actual S3 conformance remains unverified; bounded schedules are not exhaustive proof. |
+
+## Phase 6: Investigate and restore performance
+
+Goal:
+Explain and recover the reported cold-open, compaction-start and append-throughput slowdowns while preserving every Phase 1–5 correctness guarantee.
+
+Scope:
+
+- **6A — Reproduce and isolate:** Compare reviewed main, the original PR, and focused changes with identical workloads, locked dependencies, interleaved runs and explicit machine conditions. Separate measurement variability from repeatable costs.
+- **6B — Focused fixes:** Remove demonstrated allocation, copying or I/O overhead with simple implementations. Preserve cache validation/bounds, immutable publication, atomic batches, explicit outcomes and maintenance behavior.
+- **6C — Evidence and release:** Record raw runs, explain causes and remaining costs, update README/PR, pass relevant correctness tests, independent review and remote CI.
+
+Completion gate:
+Every reported slowdown has a measured disposition. Targeted changes improve the affected workload without giving up correctness or hiding total work. Record any residual regression explicitly.
+
+Testing plan:
+
+- Exercise cache corruption, identity, byte boundaries and cold/warm recovery whenever cache paths change; run the full feature matrix and release/CI checks before completion.
+- Use repeated interleaved timings and focused allocation/I/O diagnostics. Retain main and original-PR comparisons, distribution summaries and raw results.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 6A: Reproduce and isolate reported regressions | `PERFORMANCE_INVESTIGATION.md` and `performance-investigation.json`: interleaved comparisons, syscall trace, encoder assembly inspection, paired ablations and cold GET/cache allocation/fault controls. Startup slowdown did not reproduce; cold-open and short-case residuals are explicit. |
+| Complete | Work | 6B: Simple fixes preserving guarantees | `src/cache.rs` batches metadata and reuses an exclusively created temporary name; `src/image.rs` constructs errors on failure. Extended throughput 1.602M→1.750M entries/s versus main 1.770M; RTT1 batch64 recovers to main's level. WTC2 frame, collision ownership and overlapping-publication regressions pass. |
+| In Progress | Work | 6C: Updated performance evidence and release documentation | Final six-round comparison, intermediate raw cohorts, reproducible tools, README and performance reports updated. Needs: PR publication. |
+| Complete | Test | Final production correctness and compatibility gates | All-feature 113, no-default 85, release library 30, release limits/outcomes 27, example 3; Clippy all-targets, fmt/diff and Rust 1.89 all-targets passed. Cold diagnostic ran nine rounds each unpinned, CPU8 and prior-GET control. Real S3 remains ignored. |
+| In Progress | Gate | Reviewed performance recovery and passing release checks | Independent Phase 6 review approved source, tests, raw medians, assembly and final documentation. Needs: CI on published changes. Residual -6.4% short throughput and +19.1% cold-open latency remain documented; bounded tests are not exhaustive proof. |

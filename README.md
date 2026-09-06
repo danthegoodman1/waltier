@@ -215,7 +215,7 @@ cargo bench --bench wal -- --rtt-ms 15 --mbps 100 --writes 200
 
 It reports write latency percentiles and throughput, per-write cost growth without compaction, cold versus warm open, and replica polling cost. The review benchmarks cover sustained folds, batch sizes, cache policies, larger images, and snapshot/compaction memory. See [PERFORMANCE.md](PERFORMANCE.md) for reproducible inputs, repeated measurements, and the supported workload envelope. Results from simulated latency are not measurements of a real S3 service.
 
-In the three-run comparison against the previous `main`, replacement-fold acknowledgement p99 fell from 31.01 to 15.42 ms at 15 ms simulated RTT; total maintenance cost stayed essentially unchanged. A prepared 16 MiB snapshot retained about 16 MiB less heap. The report includes cache-policy results and slower cold-open measurements as well as these improvements.
+In the final six-round comparison against the previous `main`, replacement-fold acknowledgement p99 fell from 31.19 to 15.42 ms at 15 ms simulated RTT; total maintenance cost stayed essentially unchanged. A prepared 16 MiB snapshot retained about 16 MiB less heap. Batching cache metadata writes, avoiding eager encoder errors, and reusing exclusively created temporary filenames recovered extended zero-RTT throughput from 1.60M to 1.75M entries/s, within 1.1% of main. The 1 ms batch64 workload measured 37,045 entries/s versus main's 36,926. Short zero-RTT throughput remained 6.4% lower and unpinned cold open 19.1% slower; the [investigation](PERFORMANCE_INVESTIGATION.md) includes all results, raw runs, and allocation/page-state controls for the cold-open gap. These measurements do not establish a cold-open improvement.
 
 ## What WalTier doesn't do
 

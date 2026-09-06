@@ -159,6 +159,14 @@ fn compaction_start() {
     );
 }
 fn main() {
-    retained_snapshot();
-    compaction_start();
+    // Separate processes isolate allocator history when diagnosing timings.
+    match std::env::args().nth(1).as_deref() {
+        None => {
+            retained_snapshot();
+            compaction_start();
+        }
+        Some("snapshot") => retained_snapshot(),
+        Some("startup") => compaction_start(),
+        Some(other) => panic!("unknown resource case: {other}"),
+    }
 }
