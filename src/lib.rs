@@ -12,7 +12,7 @@
 //! as separate immutable objects first (via [`ObjectStore`]), then append a WAL
 //! entry that references them.
 //!
-//! Compaction is insert-triggered and never blocks writes. A background thread
+//! Compaction is insert-triggered. A background thread
 //! folds the current entries into a new snapshot object; the writer installs
 //! the fold on its next PUT (or an explicit [`WalTier::flush`]). Read-only
 //! [`Replica`]s poll with conditional GETs and never compact.
@@ -27,11 +27,13 @@ pub mod sim;
 mod store;
 mod wal;
 
-pub use error::{StoreError, WalError};
+pub use error::{MutationOutcome, StoreError, StoreOperation, WalError, WriteError};
 #[cfg(feature = "s3")]
-pub use s3::{S3Config, S3Store};
+pub use s3::{S3Config, S3Options, S3Store};
 pub use store::{CondGet, CondPut, FsStore, MemoryStore, ObjectStore, Stored};
-pub use wal::{Options, Replica, WalTier};
+pub use wal::{
+    CachePolicy, CompactionStatus, GarbageStatus, MaintenanceStatus, Options, Replica, WalTier,
+};
 
 /// Log sequence number. Assigned by the library, starting at 0, contiguous.
 pub type Lsn = u64;
@@ -66,7 +68,17 @@ pub enum Reconcile {
     Retry,
     /// Append this rewritten entry instead.
     Replace(Vec<u8>),
-    /// Give up; `write` returns [`WalError::Conflict`] with the entry.
+    /// Give up; the append returns [`WalError::ReconcileAborted`] in [`WriteError`].
+    Abort,
+}
+
+/// A decision about an entire atomic batch after refreshing the committed state.
+#[derive(Debug)]
+pub enum ReconcileBatch {
+    Retry,
+    /// Replace the entire batch. `write_batch` accepts any count, including zero
+    /// as a no-op; `write` requires exactly one replacement entry.
+    Replace(Vec<Vec<u8>>),
     Abort,
 }
 
@@ -77,6 +89,16 @@ pub enum Reconcile {
 /// reachable once compaction is enabled (via `should_compact` or
 /// [`WalTier::compact_now`]); their defaults return an error so a basic
 /// append-only app can skip them.
+///
+/// State callbacks must be deterministic and have no external effects. Restoring
+/// a compacted prefix must produce the same state as replaying that prefix from
+/// `init`; later `apply` calls must behave identically in either case. An LSN is
+/// applied once within a reconstruction, but reopening or restoring can replay
+/// it. This is not exactly-once delivery to external systems.
+///
+/// Callbacks must return without panicking. A foreground callback panic can
+/// occur after a durable commit: discard the handle and reopen to reconstruct
+/// state. Compactor panics are reported as maintenance failures.
 pub trait WalApp: Send + Sync + 'static {
     /// In-memory state built by applying entries in LSN order.
     type State;
@@ -84,7 +106,7 @@ pub trait WalApp: Send + Sync + 'static {
     /// Empty state, before any entry.
     fn init(&self) -> Self::State;
 
-    /// Fold one entry into the state. Called exactly once per LSN, in order.
+    /// Fold one entry into this reconstruction, in increasing LSN order.
     fn apply(&self, state: &mut Self::State, lsn: Lsn, entry: &[u8]);
 
     /// Rebuild state from a snapshot produced by `compact`.
@@ -108,9 +130,30 @@ pub trait WalApp: Send + Sync + 'static {
         false
     }
 
-    /// Decide the fate of a pending entry after a write conflict. The state
-    /// already reflects the entries that won.
+    /// Compatibility adapter for independent entries. Each callback sees only
+    /// committed state, without tentative changes from earlier pending entries.
+    /// Override `reconcile_batch` for allocations, quotas, or dependent entries.
     fn reconcile(&self, _state: &Self::State, _pending: &[u8]) -> Reconcile {
         Reconcile::Abort
+    }
+
+    /// Decide the fate of the entire pending batch against refreshed state.
+    /// The default adapts `reconcile` for independent entries only. An abort
+    /// preserves the original batch; otherwise all entry rewrites stick.
+    fn reconcile_batch(&self, state: &Self::State, pending: &[Vec<u8>]) -> ReconcileBatch {
+        let mut replacement = None;
+        for (index, entry) in pending.iter().enumerate() {
+            match self.reconcile(state, entry) {
+                Reconcile::Retry => {}
+                Reconcile::Replace(bytes) => {
+                    replacement.get_or_insert_with(|| pending.to_vec())[index] = bytes;
+                }
+                Reconcile::Abort => return ReconcileBatch::Abort,
+            }
+        }
+        match replacement {
+            Some(entries) => ReconcileBatch::Replace(entries),
+            None => ReconcileBatch::Retry,
+        }
     }
 }

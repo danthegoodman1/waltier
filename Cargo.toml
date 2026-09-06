@@ -1,7 +1,8 @@
 [package]
 name = "waltier"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.89"
 description = "A tiered write-ahead log: memory, local disk, and S3, with etag-CAS fencing and user-defined compaction."
 license = "MIT"
 repository = "https://github.com/danthegoodman1/waltier"
@@ -18,6 +19,7 @@ s3 = ["dep:rusty-s3", "dep:ureq", "dep:url"]
 sim = []
 
 [dependencies]
+getrandom = "0.4"
 thiserror = "2"
 rusty-s3 = { version = "0.5", optional = true }
 ureq = { version = "2", optional = true }
@@ -34,3 +36,17 @@ required-features = ["sim"]
 name = "wal"
 harness = false
 required-features = ["sim"]
+
+[[bench]]
+name = "review"
+harness = false
+required-features = ["sim"]
+
+[[bench]]
+name = "resources"
+harness = false
+required-features = ["sim"]
+
+[[bench]]
+name = "cache"
+harness = false

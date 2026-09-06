@@ -93,11 +93,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("lsn {lsn}: set {k} {v}");
     }
 
-    wal.wait_for_compaction();
-    wal.flush()?;
-    if let Some(err) = wal.last_compaction_error() {
-        println!("compaction error: {err}");
-    }
+    println!("compaction: {:?}", wal.wait_for_compaction()?);
+    println!("flush: {:?}", wal.flush()?);
     println!("state = {:?}", wal.state());
     println!("stats = {:?}", wal.stats());
     Ok(())

@@ -236,11 +236,13 @@ impl Sim {
         p
     }
 
-    /// Only `WalError::Store` may surface, and only while faults are on.
+    /// Store/compactor errors are allowed under faults. A base snapshot can
+    /// also be superseded between a trigger and its background fetch.
     fn expect_clean<T>(&self, result: Result<T, WalError>, what: &str) {
         if let Err(e) = result {
             assert!(
-                self.faults && matches!(e, WalError::Store(_)),
+                (self.faults && matches!(e, WalError::Store(_) | WalError::Compaction(_)))
+                    || matches!(&e, WalError::Compaction(message) if message.contains("is gone")),
                 "seed {}: unexpected {what} error: {e}",
                 self.seed
             );
@@ -252,7 +254,7 @@ impl Sim {
     fn settle(&mut self, wi: usize) {
         let w = self.writers[wi].instance.as_mut().unwrap();
         if w.compaction_running() {
-            w.wait_for_compaction();
+            let _ = w.wait_for_compaction();
         }
         if !self.faults
             && let Some(e) = w.last_compaction_error()
@@ -304,7 +306,11 @@ impl Sim {
                             );
                             self.log(step, &format!("writer {wi} wrote lsns {range:?}"));
                         }
-                        Err(WalError::Conflict { entries: back }) => {
+                        Err(waltier::WriteError {
+                            entries: back,
+                            source: WalError::ReconcileAborted,
+                            ..
+                        }) => {
                             assert!(
                                 matches!(self.app.mode, Mode::Abort),
                                 "seed {}: only Abort mode may surface Conflict here",
@@ -318,11 +324,11 @@ impl Sim {
                                 if !self.faults {
                                     second.expect("resubmit after refresh must succeed");
                                 } else {
-                                    self.expect_clean(second, "resubmit");
+                                    self.expect_clean(second.map_err(|e| e.source), "resubmit");
                                 }
                             }
                         }
-                        Err(e) => self.expect_clean::<()>(Err(e), "write"),
+                        Err(e) => self.expect_clean::<()>(Err(e.source), "write"),
                     }
                     self.settle(wi);
                 }
@@ -400,6 +406,17 @@ impl Sim {
     /// Invariants, checked after every step via an oracle replica reading the
     /// raw (fault-free) store.
     fn check(&mut self, step: usize) {
+        // The baseline simulator explicitly services cleanup between steps.
+        // Separate barrier tests hold cleanup across foreground appends.
+        for slot in &mut self.writers {
+            if let Some(writer) = &mut slot.instance {
+                let result = writer.collect_garbage();
+                assert!(
+                    self.faults || result.is_ok(),
+                    "fault-free cleanup: {result:?}"
+                );
+            }
+        }
         let seed = self.seed;
         self.oracle
             .refresh()
@@ -480,12 +497,22 @@ impl Sim {
             );
             let w = self.writers[wi].instance.as_mut().unwrap();
             w.refresh().unwrap();
+            if w.last_compaction_error().is_some() {
+                // The failure is now observable: acknowledge it, then retry
+                // against the refreshed image after faults have stopped.
+                w.take_compaction_error();
+                w.compact_now();
+            }
             w.flush().unwrap();
             let entry = self.payload();
             let w = self.writers[wi].instance.as_mut().unwrap();
             match w.write(entry) {
                 Ok(_) => {}
-                Err(WalError::Conflict { entries }) => {
+                Err(waltier::WriteError {
+                    entries,
+                    source: WalError::ReconcileAborted,
+                    ..
+                }) => {
                     // Abort mode: the refresh already reconciled; resubmit.
                     self.writers[wi]
                         .instance

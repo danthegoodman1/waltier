@@ -173,7 +173,9 @@ impl SimStore {
         if self.rng.lock().unwrap().chance(p) {
             self.count(|c| c.faults_injected += 1);
             self.pause(0);
-            return Err(StoreError(format!("simulated clean failure: {what} {key}")));
+            return Err(
+                StoreError::new(format!("simulated clean failure: {what} {key}")).not_applied(),
+            );
         }
         Ok(())
     }
@@ -198,13 +200,21 @@ impl SimStore {
     }
 
     fn ambiguous(what: &str, key: &str) -> StoreError {
-        StoreError(format!(
+        StoreError::new(format!(
             "simulated ambiguous failure: {what} {key} (op executed)"
         ))
     }
 }
 
 impl ObjectStore for SimStore {
+    fn cache_namespace(&self) -> Option<String> {
+        self.inner.cache_namespace()
+    }
+
+    fn max_object_bytes(&self) -> Option<usize> {
+        self.inner.max_object_bytes()
+    }
+
     fn get(&self, key: &str) -> Result<Option<Stored>, StoreError> {
         self.roll_clean_fault("get", key)?;
         let found = self.inner.get(key)?;

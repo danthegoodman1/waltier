@@ -229,7 +229,7 @@ fn bench_open(cfg: &Cfg) {
         wal.write(entry_for(key, blob)).unwrap();
     }
     assert!(wal.compact_now());
-    assert!(wal.wait_for_compaction());
+    assert!(wal.wait_for_compaction().unwrap() == waltier::CompactionStatus::Ready);
     wal.flush().unwrap();
     let snapshot_bytes = 8 * (blob + 8);
     drop(wal);
